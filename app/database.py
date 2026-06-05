@@ -59,3 +59,24 @@ def init_database() -> None:
             )
             """
         )
+        connection.execute(
+            """
+            CREATE TABLE IF NOT EXISTS workout_logs (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                weekly_plan_id INTEGER NOT NULL UNIQUE,
+                user_id INTEGER NOT NULL,
+                workout_type TEXT NOT NULL,
+                status TEXT NOT NULL,
+                distance_km REAL,
+                duration_minutes REAL,
+                exercises_text TEXT,
+                exercise_count INTEGER,
+                set_count INTEGER,
+                feeling INTEGER,
+                note TEXT,
+                created_at TEXT NOT NULL,
+                FOREIGN KEY(weekly_plan_id) REFERENCES weekly_plans(id),
+                FOREIGN KEY(user_id) REFERENCES users(id)
+            )
+            """
+        )

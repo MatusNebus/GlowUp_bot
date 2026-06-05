@@ -23,7 +23,19 @@ VALID_DAYS = {
     "sobota",
     "nedela",
 }
-PLAN_FORMAT_MESSAGE = "Správny formát je: jonas plan <typ> <deň> <čas>, napríklad: jonas plan beh piatok 18:00"
+DAY_ORDER = {
+    "pondelok": 1,
+    "utorok": 2,
+    "streda": 3,
+    "stvrtok": 4,
+    "piatok": 5,
+    "sobota": 6,
+    "nedela": 7,
+}
+PLAN_FORMAT_MESSAGE = (
+    "Správny formát je: jonas plan <typ> <deň> <čas>, "
+    "napríklad: jonas plan beh piatok 18:00"
+)
 
 
 def get_current_week_start() -> str:
@@ -108,7 +120,7 @@ def add_plan(
                 "Ak chceš bonusový tréning, doplníme to neskôr.",
             )
 
-        connection.execute(
+        cursor = connection.execute(
             """
             INSERT INTO weekly_plans (
                 user_id,
@@ -129,10 +141,11 @@ def add_plan(
                 datetime.now(timezone.utc).isoformat(),
             ),
         )
+        plan_id = cursor.lastrowid
 
     return (
         True,
-        f"{user['display_name']} má naplánované: "
+        f"{user['display_name']} má naplánované [{plan_id}]: "
         f"{normalized_type}, {normalized_day} o {planned_time}.",
     )
 
@@ -149,7 +162,7 @@ def list_my_week(discord_user_id: str) -> tuple[bool, str]:
     if not plans:
         return True, f"{user['display_name']} zatiaľ nemá plán na aktuálny týždeň."
 
-    return True, _format_week_plans(plans, f"Plán pre {user['display_name']}:")
+    return True, _format_week_plans(plans, f"Plán pre {user['display_name']}:", False)
 
 
 def list_all_week() -> str:
@@ -160,7 +173,7 @@ def list_all_week() -> str:
     if not plans:
         return "Zatiaľ nie je naplánovaný žiadny tréning na aktuálny týždeň."
 
-    return _format_week_plans(plans, "Týždenný plán:")
+    return _format_week_plans(plans, "Týždenný plán:", True)
 
 
 def weekly_status(discord_user_id: str) -> tuple[bool, str]:
@@ -201,9 +214,7 @@ def weekly_status(discord_user_id: str) -> tuple[bool, str]:
             (user["id"], week_start),
         ).fetchall()
 
-    counts_by_type = {
-        row["workout_type"]: row["plan_count"] for row in planned_counts
-    }
+    counts_by_type = {row["workout_type"]: row["plan_count"] for row in planned_counts}
 
     lines = [f"{user['display_name']} — stav plánovania:"]
     for commitment in commitments:
@@ -211,11 +222,7 @@ def weekly_status(discord_user_id: str) -> tuple[bool, str]:
         required_count = commitment["count_per_week"]
         planned_count = counts_by_type.get(workout_type, 0)
         missing_count = max(required_count - planned_count, 0)
-
-        if missing_count == 0:
-            suffix = "hotovo"
-        else:
-            suffix = f"chýba {missing_count}"
+        suffix = "hotovo" if missing_count == 0 else f"chýba {missing_count}"
 
         lines.append(
             f"{workout_type}: {planned_count}/{required_count} naplánované, {suffix}"
@@ -257,7 +264,7 @@ def _fetch_week_plans(connection, user_id: int | None = None):
         user_filter = "AND users.id = ?"
         parameters.append(user_id)
 
-    return connection.execute(
+    rows = connection.execute(
         f"""
         SELECT
             weekly_plans.id,
@@ -272,20 +279,27 @@ def _fetch_week_plans(connection, user_id: int | None = None):
         WHERE weekly_plans.week_start = ?
           AND users.is_active = 1
           {user_filter}
-        ORDER BY users.display_name ASC, weekly_plans.planned_day ASC, weekly_plans.planned_time ASC
         """,
         parameters,
     ).fetchall()
 
+    return sorted(
+        rows,
+        key=lambda row: (
+            row["display_name"],
+            DAY_ORDER.get(row["planned_day"], 99),
+            row["planned_time"],
+        ),
+    )
 
-def _format_week_plans(plans, title: str) -> str:
+
+def _format_week_plans(plans, title: str, include_name: bool) -> str:
     lines = [title]
     for plan in plans:
+        owner = f"{plan['display_name']}: " if include_name else ""
         lines.append(
-            "- "
-            f"{plan['display_name']}: "
-            f"{plan['workout_type']}, "
-            f"{plan['planned_day']} o {plan['planned_time']} "
-            f"({plan['status']})"
+            f"{owner}[{plan['id']}] "
+            f"{plan['planned_day']} {plan['planned_time']} — "
+            f"{plan['workout_type']} — {plan['status']}"
         )
     return "\n".join(lines)

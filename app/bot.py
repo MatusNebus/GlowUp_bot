@@ -12,10 +12,21 @@ from app.services.planning_service import (
     weekly_status,
 )
 from app.services.users_service import list_users, register_user
+from app.services.workout_service import (
+    complete_workout,
+    get_workout_detail,
+    miss_workout,
+    shorten_workout,
+)
 
 
 # Textové aliasy, na ktoré má Jonáš reagovať aj bez reálneho Discord označenia.
 ALIASES = ("jony", "jonas", "jonáš")
+
+DONE_FORMAT_MESSAGE = "Správny formát je: jonas done <plan_id> <výsledok>, napríklad: jonas done 3 5.2 32"
+SHORT_FORMAT_MESSAGE = "Správny formát je: jonas short <plan_id> <výsledok>, napríklad: jonas short 3 3.0 20"
+MISSED_FORMAT_MESSAGE = "Správny formát je: jonas missed <plan_id>, napríklad: jonas missed 3"
+WORKOUT_FORMAT_MESSAGE = "Správny formát je: jonas workout <plan_id>, napríklad: jonas workout 3"
 
 intents = discord.Intents.default()
 intents.message_content = True
@@ -119,6 +130,33 @@ def _parse_plan_command(command_text: str) -> tuple[str, str, str] | None:
     return workout_type, planned_day, planned_time
 
 
+def _parse_result_command(command_text: str, command_name: str) -> tuple[int, str] | None:
+    prefix = f"{command_name} "
+    if not command_text.casefold().startswith(prefix):
+        return None
+
+    payload = command_text[len(prefix) :].strip()
+    if not payload:
+        return None
+
+    plan_id_text, _, result_text = payload.partition(" ")
+    if not plan_id_text.isdigit() or not result_text.strip():
+        return None
+
+    return int(plan_id_text), result_text.strip()
+
+
+def _parse_plan_id_command(command_text: str, command_name: str) -> int | None:
+    parts = command_text.split()
+    if len(parts) != 2 or parts[0].casefold() != command_name:
+        return None
+
+    if not parts[1].isdigit():
+        return None
+
+    return int(parts[1])
+
+
 @client.event
 async def on_ready() -> None:
     print(f"Jonáš je online ako {client.user}")
@@ -142,7 +180,9 @@ async def on_message(message: discord.Message) -> None:
             "jonas register Ema, jonas users, jonas commitment beh 2, "
             "jonas commitments, jonas commitments all, "
             "jonas plan beh piatok 18:00, jonas my week, jonas week, "
-            "jonas planning status"
+            "jonas planning status, jonas done 3 5.2 32, "
+            "jonas done 4 drepy 3x12; kliky 3x8, jonas short 3 3.0 20, "
+            "jonas missed 3, jonas workout 3"
         )
         return
 
@@ -208,6 +248,48 @@ async def on_message(message: discord.Message) -> None:
 
     if normalized_command == "week":
         await message.channel.send(list_all_week())
+        return
+
+    if normalized_command == "done" or normalized_command.startswith("done "):
+        parsed_result = _parse_result_command(command_text, "done")
+        if parsed_result is None:
+            await message.channel.send(DONE_FORMAT_MESSAGE)
+            return
+
+        plan_id, result_text = parsed_result
+        _, response = complete_workout(str(message.author.id), plan_id, result_text)
+        await message.channel.send(response)
+        return
+
+    if normalized_command == "short" or normalized_command.startswith("short "):
+        parsed_result = _parse_result_command(command_text, "short")
+        if parsed_result is None:
+            await message.channel.send(SHORT_FORMAT_MESSAGE)
+            return
+
+        plan_id, result_text = parsed_result
+        _, response = shorten_workout(str(message.author.id), plan_id, result_text)
+        await message.channel.send(response)
+        return
+
+    if normalized_command == "missed" or normalized_command.startswith("missed "):
+        plan_id = _parse_plan_id_command(command_text, "missed")
+        if plan_id is None:
+            await message.channel.send(MISSED_FORMAT_MESSAGE)
+            return
+
+        _, response = miss_workout(str(message.author.id), plan_id)
+        await message.channel.send(response)
+        return
+
+    if normalized_command == "workout" or normalized_command.startswith("workout "):
+        plan_id = _parse_plan_id_command(command_text, "workout")
+        if plan_id is None:
+            await message.channel.send(WORKOUT_FORMAT_MESSAGE)
+            return
+
+        _, response = get_workout_detail(str(message.author.id), plan_id)
+        await message.channel.send(response)
         return
 
     await message.channel.send(
