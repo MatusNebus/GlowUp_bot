@@ -4,6 +4,13 @@ import discord
 
 from app.config import DISCORD_TOKEN
 from app.services.commitments_service import list_commitments, set_commitment
+from app.services.planning_service import (
+    PLAN_FORMAT_MESSAGE,
+    add_plan,
+    list_all_week,
+    list_my_week,
+    weekly_status,
+)
 from app.services.users_service import list_users, register_user
 
 
@@ -103,6 +110,15 @@ def _parse_commitment_command(command_text: str) -> tuple[str, int] | None:
     return workout_type, count_per_week
 
 
+def _parse_plan_command(command_text: str) -> tuple[str, str, str] | None:
+    parts = command_text.split()
+    if len(parts) != 4:
+        return None
+
+    _, workout_type, planned_day, planned_time = parts
+    return workout_type, planned_day, planned_time
+
+
 @client.event
 async def on_ready() -> None:
     print(f"Jonáš je online ako {client.user}")
@@ -124,7 +140,9 @@ async def on_message(message: discord.Message) -> None:
         await message.channel.send(
             "Príkazy: jonas help, jonas ping, jonas register Matúš, "
             "jonas register Ema, jonas users, jonas commitment beh 2, "
-            "jonas commitments, jonas commitments all"
+            "jonas commitments, jonas commitments all, "
+            "jonas plan beh piatok 18:00, jonas my week, jonas week, "
+            "jonas planning status"
         )
         return
 
@@ -163,6 +181,33 @@ async def on_message(message: discord.Message) -> None:
 
     if normalized_command == "commitments all":
         await message.channel.send(_format_commitments())
+        return
+
+    if normalized_command == "planning status":
+        _, response = weekly_status(str(message.author.id))
+        await message.channel.send(response)
+        return
+
+    if normalized_command == "plan" or normalized_command.startswith("plan "):
+        parsed_plan = _parse_plan_command(command_text)
+        if parsed_plan is None:
+            await message.channel.send(PLAN_FORMAT_MESSAGE)
+            return
+
+        workout_type, planned_day, planned_time = parsed_plan
+        _, response = add_plan(
+            str(message.author.id), workout_type, planned_day, planned_time
+        )
+        await message.channel.send(response)
+        return
+
+    if normalized_command == "my week":
+        _, response = list_my_week(str(message.author.id))
+        await message.channel.send(response)
+        return
+
+    if normalized_command == "week":
+        await message.channel.send(list_all_week())
         return
 
     await message.channel.send(
