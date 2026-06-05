@@ -4,6 +4,7 @@ import discord
 
 from app.config import DISCORD_TOKEN
 from app.services.commitments_service import list_commitments, set_commitment
+from app.services.joker_service import JOKER_FORMAT_MESSAGE, joker_status, use_joker
 from app.services.planning_service import (
     PLAN_FORMAT_MESSAGE,
     add_plan,
@@ -23,10 +24,20 @@ from app.services.workout_service import (
 # Textové aliasy, na ktoré má Jonáš reagovať aj bez reálneho Discord označenia.
 ALIASES = ("jony", "jonas", "jonáš")
 
-DONE_FORMAT_MESSAGE = "Správny formát je: jonas done <plan_id> <výsledok>, napríklad: jonas done 3 5.2 32"
-SHORT_FORMAT_MESSAGE = "Správny formát je: jonas short <plan_id> <výsledok>, napríklad: jonas short 3 3.0 20"
-MISSED_FORMAT_MESSAGE = "Správny formát je: jonas missed <plan_id>, napríklad: jonas missed 3"
-WORKOUT_FORMAT_MESSAGE = "Správny formát je: jonas workout <plan_id>, napríklad: jonas workout 3"
+DONE_FORMAT_MESSAGE = (
+    "Správny formát je: jonas done <plan_id> <výsledok>, "
+    "napríklad: jonas done 3 5.2 32"
+)
+SHORT_FORMAT_MESSAGE = (
+    "Správny formát je: jonas short <plan_id> <výsledok>, "
+    "napríklad: jonas short 3 3.0 20"
+)
+MISSED_FORMAT_MESSAGE = (
+    "Správny formát je: jonas missed <plan_id>, napríklad: jonas missed 3"
+)
+WORKOUT_FORMAT_MESSAGE = (
+    "Správny formát je: jonas workout <plan_id>, napríklad: jonas workout 3"
+)
 
 intents = discord.Intents.default()
 intents.message_content = True
@@ -157,6 +168,18 @@ def _parse_plan_id_command(command_text: str, command_name: str) -> int | None:
     return int(parts[1])
 
 
+def _parse_joker_command(command_text: str) -> tuple[int, str, str] | None:
+    parts = command_text.split()
+    if len(parts) != 4 or parts[0].casefold() != "joker":
+        return None
+
+    _, plan_id_text, new_day, new_time = parts
+    if not plan_id_text.isdigit():
+        return None
+
+    return int(plan_id_text), new_day, new_time
+
+
 @client.event
 async def on_ready() -> None:
     print(f"Jonáš je online ako {client.user}")
@@ -182,7 +205,8 @@ async def on_message(message: discord.Message) -> None:
             "jonas plan beh piatok 18:00, jonas my week, jonas week, "
             "jonas planning status, jonas done 3 5.2 32, "
             "jonas done 4 drepy 3x12; kliky 3x8, jonas short 3 3.0 20, "
-            "jonas missed 3, jonas workout 3"
+            "jonas missed 3, jonas workout 3, jonas joker 3 sobota 10:00, "
+            "jonas joker status"
         )
         return
 
@@ -248,6 +272,22 @@ async def on_message(message: discord.Message) -> None:
 
     if normalized_command == "week":
         await message.channel.send(list_all_week())
+        return
+
+    if normalized_command == "joker status":
+        _, response = joker_status(str(message.author.id))
+        await message.channel.send(response)
+        return
+
+    if normalized_command == "joker" or normalized_command.startswith("joker "):
+        parsed_joker = _parse_joker_command(command_text)
+        if parsed_joker is None:
+            await message.channel.send(JOKER_FORMAT_MESSAGE)
+            return
+
+        plan_id, new_day, new_time = parsed_joker
+        _, response = use_joker(str(message.author.id), plan_id, new_day, new_time)
+        await message.channel.send(response)
         return
 
     if normalized_command == "done" or normalized_command.startswith("done "):

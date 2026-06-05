@@ -75,7 +75,7 @@ def add_plan(
     except ValueError:
         return False, "Deň musí byť jeden zo slovenských dní. " + PLAN_FORMAT_MESSAGE
 
-    if not _is_valid_time(planned_time):
+    if not is_valid_time(planned_time):
         return False, "Čas musí byť vo formáte HH:MM, napríklad 18:00."
 
     week_start = get_current_week_start()
@@ -236,12 +236,16 @@ def _strip_accents(text: str) -> str:
     return "".join(char for char in decomposed if not unicodedata.combining(char))
 
 
-def _is_valid_time(time_text: str) -> bool:
+def is_valid_time(time_text: str) -> bool:
     if re.fullmatch(r"\d{2}:\d{2}", time_text) is None:
         return False
 
     hours, minutes = time_text.split(":")
     return 0 <= int(hours) <= 23 and 0 <= int(minutes) <= 59
+
+
+def _is_valid_time(time_text: str) -> bool:
+    return is_valid_time(time_text)
 
 
 def _get_user(connection, discord_user_id: str):

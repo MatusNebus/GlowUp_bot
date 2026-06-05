@@ -80,3 +80,21 @@ def init_database() -> None:
             )
             """
         )
+        connection.execute(
+            """
+            CREATE TABLE IF NOT EXISTS jokers (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                user_id INTEGER NOT NULL,
+                week_start TEXT NOT NULL,
+                weekly_plan_id INTEGER NOT NULL,
+                used_at TEXT NOT NULL,
+                old_day TEXT NOT NULL,
+                old_time TEXT NOT NULL,
+                new_day TEXT NOT NULL,
+                new_time TEXT NOT NULL,
+                UNIQUE(user_id, week_start),
+                FOREIGN KEY(user_id) REFERENCES users(id),
+                FOREIGN KEY(weekly_plan_id) REFERENCES weekly_plans(id)
+            )
+            """
+        )
