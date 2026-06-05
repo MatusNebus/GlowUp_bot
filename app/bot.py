@@ -3,6 +3,7 @@ import re
 import discord
 
 from app.config import DISCORD_TOKEN
+from app.services.commitments_service import list_commitments, set_commitment
 from app.services.users_service import list_users, register_user
 
 
@@ -71,6 +72,37 @@ def _format_users() -> str:
     return "Registrovaní používatelia: " + ", ".join(names)
 
 
+def _format_commitments(discord_user_id: str | None = None) -> str:
+    commitments = list_commitments(discord_user_id)
+    if not commitments:
+        return "Zatiaľ nie sú nastavené žiadne tréningové záväzky."
+
+    lines = ["Tréningové záväzky:"]
+    for commitment in commitments:
+        lines.append(
+            "- "
+            f"{commitment['display_name']}: "
+            f"{commitment['workout_type']} "
+            f"{commitment['count_per_week']}x týždenne"
+        )
+
+    return "\n".join(lines)
+
+
+def _parse_commitment_command(command_text: str) -> tuple[str, int] | None:
+    parts = command_text.split()
+    if len(parts) != 3:
+        return None
+
+    _, workout_type, count_text = parts
+    try:
+        count_per_week = int(count_text)
+    except ValueError:
+        return None
+
+    return workout_type, count_per_week
+
+
 @client.event
 async def on_ready() -> None:
     print(f"Jonáš je online ako {client.user}")
@@ -91,7 +123,8 @@ async def on_message(message: discord.Message) -> None:
     if normalized_command == "help":
         await message.channel.send(
             "Príkazy: jonas help, jonas ping, jonas register Matúš, "
-            "jonas register Ema, jonas users"
+            "jonas register Ema, jonas users, jonas commitment beh 2, "
+            "jonas commitments, jonas commitments all"
         )
         return
 
@@ -107,6 +140,29 @@ async def on_message(message: discord.Message) -> None:
 
     if normalized_command == "users":
         await message.channel.send(_format_users())
+        return
+
+    if normalized_command.startswith("commitment "):
+        parsed_commitment = _parse_commitment_command(command_text)
+        if parsed_commitment is None:
+            await message.channel.send(
+                "Nerozumiem záväzku. Skús napríklad: jonas commitment beh 2"
+            )
+            return
+
+        workout_type, count_per_week = parsed_commitment
+        _, response = set_commitment(
+            str(message.author.id), workout_type, count_per_week
+        )
+        await message.channel.send(response)
+        return
+
+    if normalized_command == "commitments":
+        await message.channel.send(_format_commitments(str(message.author.id)))
+        return
+
+    if normalized_command == "commitments all":
+        await message.channel.send(_format_commitments())
         return
 
     await message.channel.send(

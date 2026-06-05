@@ -29,3 +29,16 @@ def init_database() -> None:
             )
             """
         )
+        connection.execute(
+            """
+            CREATE TABLE IF NOT EXISTS commitments (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                user_id INTEGER NOT NULL,
+                workout_type TEXT NOT NULL,
+                count_per_week INTEGER NOT NULL,
+                created_at TEXT NOT NULL,
+                is_active INTEGER NOT NULL DEFAULT 1,
+                FOREIGN KEY(user_id) REFERENCES users(id)
+            )
+            """
+        )
