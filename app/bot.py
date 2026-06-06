@@ -1,7 +1,14 @@
+import asyncio
+import json
 import re
 
 import discord
 
+from app.ai_parser import (
+    AI_NOT_CONFIGURED_MESSAGE,
+    OpenAIKeyMissingError,
+    parse_natural_message,
+)
 from app.config import DISCORD_TOKEN
 from app.services.commitments_service import list_commitments, set_commitment
 from app.services.joker_service import JOKER_FORMAT_MESSAGE, joker_status, use_joker
@@ -206,6 +213,150 @@ def _parse_stats_command(command_text: str) -> tuple[bool, str | None] | None:
     return None
 
 
+async def _parse_with_ai(message_text: str, author_display_name: str) -> dict | None:
+    try:
+        return await asyncio.to_thread(
+            parse_natural_message, message_text, author_display_name
+        )
+    except OpenAIKeyMissingError:
+        return None
+    except Exception as error:
+        print(f"OpenAI parser chyba: {error}")
+        raise
+
+
+async def _execute_ai_intent(message: discord.Message, parsed: dict) -> None:
+    discord_user_id = str(message.author.id)
+    intent = parsed["intent"]
+
+    if intent == "plan_workout":
+        if not parsed["day"] or not parsed["time"]:
+            await message.channel.send(
+                "Potrebujem deň aj čas. Napíš napríklad: jonas v piatok o 18:00 beh"
+            )
+            return
+        if not parsed["workout_type"]:
+            await message.channel.send(
+                "Rozumiem, že niečo chceš, ale nemám dosť údajov. "
+                "Skús to napísať konkrétnejšie: typ tréningu, deň, čas alebo ID tréningu."
+            )
+            return
+        _, response = add_plan(
+            discord_user_id,
+            parsed["workout_type"],
+            parsed["day"],
+            parsed["time"],
+        )
+        await message.channel.send(response)
+        return
+
+    if intent in {"log_done", "log_short", "log_missed", "use_joker"}:
+        if parsed["plan_id"] is None:
+            await message.channel.send(
+                "Potrebujem ID tréningu. Pozri si ho cez: jonas my week"
+            )
+            return
+
+    if intent == "log_done":
+        if not parsed["result_text"]:
+            if parsed["workout_type"] == "beh":
+                response = (
+                    "Pri behu potrebujem kilometre a čas. Napríklad: "
+                    "jonas tréning 3 hotový, 5.2 km za 32 min"
+                )
+            else:
+                response = "Potrebujem aj výsledok tréningu."
+            await message.channel.send(response)
+            return
+        _, response = complete_workout(
+            discord_user_id, parsed["plan_id"], parsed["result_text"]
+        )
+        await message.channel.send(response)
+        return
+
+    if intent == "log_short":
+        if not parsed["result_text"]:
+            await message.channel.send("Potrebujem aj výsledok skráteného tréningu.")
+            return
+        _, response = shorten_workout(
+            discord_user_id, parsed["plan_id"], parsed["result_text"]
+        )
+        await message.channel.send(response)
+        return
+
+    if intent == "log_missed":
+        _, response = miss_workout(discord_user_id, parsed["plan_id"])
+        await message.channel.send(response)
+        return
+
+    if intent == "use_joker":
+        if not parsed["day"] or not parsed["time"]:
+            await message.channel.send(
+                "Potrebujem nový deň aj čas. Napíš napríklad: "
+                "jonas posuň tréning 4 na sobotu 10:00"
+            )
+            return
+        _, response = use_joker(
+            discord_user_id, parsed["plan_id"], parsed["day"], parsed["time"]
+        )
+        await message.channel.send(response)
+        return
+
+    if intent == "show_my_week":
+        _, response = list_my_week(discord_user_id)
+        await message.channel.send(response)
+        return
+
+    if intent == "show_week":
+        await message.channel.send(list_all_week())
+        return
+
+    if intent == "show_planning_status":
+        _, response = weekly_status(discord_user_id)
+        await message.channel.send(response)
+        return
+
+    if intent == "show_stats":
+        _, response = get_user_month_stats(discord_user_id, parsed["month"])
+        await message.channel.send(response)
+        return
+
+    if intent == "show_stats_all":
+        await message.channel.send(get_all_month_stats(parsed["month"]))
+        return
+
+    if intent == "set_commitment":
+        if not parsed["workout_type"] or parsed["count_per_week"] is None:
+            await message.channel.send(
+                "Potrebujem typ tréningu aj počet za týždeň. "
+                "Napíš napríklad: jonas chcem behať 2x týždenne"
+            )
+            return
+        _, response = set_commitment(
+            discord_user_id, parsed["workout_type"], parsed["count_per_week"]
+        )
+        await message.channel.send(response)
+        return
+
+    if intent == "forbidden_walk_replacement":
+        await message.channel.send(
+            "Nie. Prechádzka sa podľa pravidiel Couple GlowUp neráta ako tréning "
+            "a nemôže nahradiť plánovaný beh ani posilku. Môže byť bonus alebo "
+            "regenerácia, ale povinný tréning ostáva."
+        )
+        return
+
+    if intent == "ask_matus_decision":
+        question = parsed["decision_question"] or parsed["raw_summary"]
+        await message.channel.send(f"Matúš, potrebujem rozhodnutie: {question}")
+        return
+
+    await message.channel.send(
+        "Rozumiem, že niečo chceš, ale nemám dosť údajov. "
+        "Skús to napísať konkrétnejšie: typ tréningu, deň, čas alebo ID tréningu."
+    )
+
+
 @client.event
 async def on_ready() -> None:
     print(f"Jonáš je online ako {client.user}")
@@ -236,7 +387,10 @@ async def on_message(message: discord.Message) -> None:
             "jonas joker status, jonas stats, jonas stats 2026-06, "
             "jonas stats all, jonas report all, jonas test scheduler. "
             "Automatické správy: nedeľa 19:00 plánovanie, denne 06:00 ranný plán, "
-            "denne 20:00 príprava na zajtra, po tréningu kontrola."
+            "denne 20:00 príprava na zajtra, po tréningu kontrola. "
+            "Prirodzený jazyk: jonas v piatok o 18:00 beh; "
+            "jonas tréning 3 hotový, 5.2 km za 32 min; "
+            "jonas posuň tréning 4 na sobotu 10:00; jonas ukáž štatistiky."
         )
         return
 
@@ -325,6 +479,32 @@ async def on_message(message: discord.Message) -> None:
         await message.channel.send(response)
         return
 
+    if normalized_command == "ai test" or normalized_command.startswith("ai test "):
+        test_text = command_text[len("ai test") :].strip()
+        if not test_text:
+            await message.channel.send(
+                "Napíš text na testovanie, napríklad: "
+                "jonas ai test v piatok o šiestej večer beh"
+            )
+            return
+
+        author_name = getattr(message.author, "display_name", str(message.author))
+        try:
+            parsed = await _parse_with_ai(test_text, author_name)
+        except Exception:
+            await message.channel.send(
+                "OpenAI parser teraz neodpovedal. Skús to znova o chvíľu."
+            )
+            return
+
+        if parsed is None:
+            await message.channel.send(AI_NOT_CONFIGURED_MESSAGE)
+            return
+
+        parser_json = json.dumps(parsed, ensure_ascii=False, indent=2)
+        await message.channel.send(f"```json\n{parser_json[:1850]}\n```")
+        return
+
     if normalized_command.startswith("stats") or normalized_command.startswith(
         "report"
     ):
@@ -383,9 +563,21 @@ async def on_message(message: discord.Message) -> None:
         await message.channel.send(response)
         return
 
-    await message.channel.send(
-        "Som tu, ale tento príkaz ešte nepoznám. Skús: jonas help"
-    )
+    author_name = getattr(message.author, "display_name", str(message.author))
+    try:
+        parsed = await _parse_with_ai(command_text, author_name)
+    except Exception:
+        await message.channel.send(
+            "OpenAI parser teraz neodpovedal. Tvrdé príkazy stále fungujú cez: "
+            "jonas help"
+        )
+        return
+
+    if parsed is None:
+        await message.channel.send(AI_NOT_CONFIGURED_MESSAGE)
+        return
+
+    await _execute_ai_intent(message, parsed)
 
 
 def run_bot() -> None:
