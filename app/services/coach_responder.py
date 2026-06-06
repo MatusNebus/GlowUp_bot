@@ -8,12 +8,16 @@ Si Jonáš, tréner v Couple GlowUp Bot. Odpovedaj po slovensky.
 Tón je podporujúci, ale prísny, praktický a občas jemne vtipný, nikdy cringe.
 Odpoveď má typicky 1 až 4 krátke vety.
 Píš iba krátky trénerovský komentár. Neopakuj faktický výsledok, aplikácia ho
-zobrazí samostatne pred tvojím komentárom.
+zobrazí samostatne pred tvojím komentárom. Pri general_advice, casual_chat,
+app_help a context_question však odpovedz priamo na požiadavku alebo response hint,
+pretože žiadny samostatný výsledok sa nezobrazí.
 
 Nemôžeš meniť ani obchádzať systémové pravidlá:
 - prechádzka nikdy nenahrádza povinný tréning,
 - žolík je iba raz týždenne a posúva tréning maximálne o jeden deň,
 - nedeľa nemení počet tréningov, iba harmonogram,
+- zmena záväzku mimo onboardingu a dev režimu potrebuje súhlas všetkých aktívnych používateľov,
+- vynechania sa vždy zapisujú,
 - pri vynechaní buď priamy a prísny, bez urážok,
 - pri splnení pochváľ stručne,
 - nepridávaj fakty, ktoré nie sú vo faktickom výsledku,
@@ -47,7 +51,7 @@ def generate_coach_reply(
         reply = response.output_text.strip()
         if not reply:
             return fallback
-        if event_type == "general_advice":
+        if event_type in {"general_advice", "casual_chat", "app_help", "context_question"}:
             return reply
         return f"{factual_result}\n\n{reply}"
     except Exception as error:
@@ -103,7 +107,7 @@ def respond_unknown(message: str | None = None) -> str:
         "Rozumiem, že niečo chceš, ale nemám dosť údajov. "
         "Doplň typ tréningu, deň, čas alebo ID tréningu."
     )
-    return f"{detail}\n\nPovedz mi konkrétne, čo chceš spraviť."
+    return f"{detail}Povedz mi konkrétne, čo chceš spraviť."
 
 
 def respond_forbidden_walk() -> str:
@@ -133,11 +137,11 @@ def respond_stats(action_result: str) -> str:
 
 
 def _fallback_for_event(event_type: str, factual_result: str) -> str:
-    if event_type == "general_advice":
+    if event_type in {"general_advice", "casual_chat", "app_help", "context_question"}:
         return (
-            "Začni prakticky: drž sa svojho plánu, uprav intenzitu podľa reálneho "
-            "stavu a nesnaž sa jedným dňom dohnať celý mesiac. Ak ide o bolesť "
-            "alebo zranenie, tréning stopni a poraď sa s odborníkom."
+            factual_result
+            if factual_result
+            else "Povedz mi to trochu konkrétnejšie a nájdeme praktický ďalší krok."
         )
 
     responders = {

@@ -34,7 +34,7 @@ def register_user(discord_user_id: str, display_name: str) -> tuple[bool, str]:
             ),
         )
 
-    return True, f"{clean_name} je registrovaný. GlowUp režim zapnutý."
+    return True, f"{clean_name} je registrovaný. GlowUp režim zapnutý. Onboarging: jony onboarding start"
 
 
 def list_users() -> list[dict]:

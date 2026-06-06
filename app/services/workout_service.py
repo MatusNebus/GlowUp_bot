@@ -2,7 +2,7 @@ import re
 from datetime import datetime, timezone
 
 from app.database import get_connection
-from app.services.planning_service import is_forbidden_walk_type
+from app.services.planning_service import get_plan_reference, is_forbidden_walk_type
 
 
 RUN_RESULT_FORMAT_MESSAGE = "Pri behu napíš výsledok napríklad: jonas done 3 5.2 32"
@@ -82,8 +82,9 @@ def get_workout_detail(discord_user_id: str, plan_id: int) -> tuple[bool, str]:
             (plan_id,),
         ).fetchone()
 
+    plan_ref = get_plan_reference(discord_user_id, plan["id"])
     lines = [
-        f"Tréning [{plan['id']}]",
+        f"Tréning [{plan_ref}]",
         f"{plan['planned_day']} {plan['planned_time']} — {plan['workout_type']} — {plan['status']}",
     ]
 

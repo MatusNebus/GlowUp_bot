@@ -7,9 +7,9 @@ import discord
 from app.ai_parser import (
     AI_NOT_CONFIGURED_MESSAGE,
     OpenAIKeyMissingError,
-    parse_natural_message,
 )
-from app.config import ADMIN_DISCORD_USER_ID, DISCORD_TOKEN
+from app.ai_router import route_natural_message
+from app.config import ADMIN_DISCORD_USER_ID, DISCORD_CHANNEL_ID, DISCORD_TOKEN
 from app.services.coach_responder import (
     generate_coach_reply,
     respond_error,
@@ -22,8 +22,13 @@ from app.services.coach_responder import (
     respond_success,
     respond_unknown,
 )
-from app.services.commitments_service import list_commitments, set_commitment
-from app.services.context_service import build_ai_context, save_user_message
+from app.services.commitments_service import list_commitments
+from app.services.commitment_change_service import (
+    list_changes,
+    request_commitment_change,
+    vote_change,
+)
+from app.services.context_service import build_ai_context, save_channel_message
 from app.services.dev_reset_service import reset_all, reset_me, reset_user
 from app.services.joker_service import JOKER_FORMAT_MESSAGE, joker_status, use_joker
 from app.services.onboarding_service import (
@@ -46,6 +51,7 @@ from app.services.planning_service import (
     add_plan,
     list_all_week,
     list_my_week,
+    resolve_plan_reference,
     weekly_status,
 )
 from app.services.scheduler_service import send_scheduler_test_messages, start_scheduler
@@ -311,7 +317,7 @@ def _looks_like_general_advice(message_text: str) -> bool:
     return "?" in message_text or any(keyword in text for keyword in keywords)
 
 
-async def _parse_with_ai(
+async def _route_with_ai(
     message_text: str,
     author_display_name: str,
     context_text: str,
@@ -319,7 +325,7 @@ async def _parse_with_ai(
 ) -> dict | None:
     try:
         return await asyncio.to_thread(
-            parse_natural_message,
+            route_natural_message,
             message_text,
             author_display_name,
             context_text,
@@ -328,8 +334,47 @@ async def _parse_with_ai(
     except OpenAIKeyMissingError:
         return None
     except Exception as error:
-        print(f"OpenAI parser chyba: {error}")
+        print(f"OpenAI router chyba: {error}")
         raise
+
+
+def _router_to_parsed(router_result: dict) -> dict:
+    args = router_result["tool_args"]
+    return {
+        "intent": router_result.get("intent") or "unknown",
+        "confidence": router_result["confidence"],
+        "workout_type": args["workout_type"],
+        "day": args["day"],
+        "time": args["time"],
+        "plan_id": args["plan_id"],
+        "result_text": args["result_text"],
+        "count_per_week": args["count_per_week"],
+        "month": args["month"],
+        "target_user": args["target_user"],
+        "needs_matus_decision": False,
+        "decision_question": router_result["clarification_question"],
+        "raw_summary": router_result["response_hint"],
+    }
+
+
+def _resolve_plan_id(discord_user_id: str, plan_ref: int) -> tuple[bool, int | str]:
+    return resolve_plan_reference(discord_user_id, plan_ref)
+
+
+def _request_or_set_commitment(
+    discord_user_id: str, workout_type: str, count_per_week: int
+) -> tuple[bool, str]:
+    """Nový záväzok nastaví priamo, zmenu existujúceho pošle na hlasovanie."""
+    return request_commitment_change(discord_user_id, workout_type, count_per_week)
+
+
+APP_HELP_TEXT = (
+    "Začni cez `jonas onboarding start`. Potom si nastavíš záväzky, v nedeľu ich "
+    "rozložíš do kalendára cez plánovanie a po tréningu zapíšeš výsledok cez "
+    "`jonas done <číslo> <výsledok>`. Žolík posunie jeden tréning najviac o deň, "
+    "štatistiky ukáže `jonas stats`. Prechádzka je bonus alebo regenerácia, "
+    "nikdy náhrada povinného tréningu."
+)
 
 
 async def _execute_ai_intent(message: discord.Message, parsed: dict) -> bool:
@@ -379,6 +424,11 @@ async def _execute_ai_intent(message: discord.Message, parsed: dict) -> bool:
                 response = "Potrebujem ID tréningu. Pozri si ho cez: jonas my week"
             await message.channel.send(respond_unknown(response))
             return False
+        resolved, plan_id_or_message = _resolve_plan_id(discord_user_id, parsed["plan_id"])
+        if not resolved:
+            await message.channel.send(respond_unknown(str(plan_id_or_message)))
+            return False
+        parsed["plan_id"] = int(plan_id_or_message)
 
     if intent == "log_done":
         if not parsed["result_text"]:
@@ -459,7 +509,7 @@ async def _execute_ai_intent(message: discord.Message, parsed: dict) -> bool:
                 "Napíš napríklad: jonas chcem behať 2x týždenne"
             )
             return False
-        success, response = set_commitment(
+        success, response = _request_or_set_commitment(
             discord_user_id, parsed["workout_type"], parsed["count_per_week"]
         )
         await _natural_coach_response(message, "success", response, success)
@@ -585,23 +635,41 @@ async def on_ready() -> None:
 @client.event
 async def on_message(message: discord.Message) -> None:
     # Bot ignoruje vlastné správy.
-    if message.author == client.user:
+    if getattr(message.author, "bot", False):
         return
 
     discord_user_id = str(message.author.id)
+    channel_id = str(message.channel.id)
+    should_store_message = bool(
+        DISCORD_CHANNEL_ID and channel_id == DISCORD_CHANNEL_ID.strip()
+    )
+
     command_text = _extract_command_text(message)
-    is_pending_follow_up = command_text is None
+    is_pending_follow_up = False
     pending_action = get_latest_pending_action(discord_user_id)
     active_onboarding = has_active_onboarding(discord_user_id)
-    is_onboarding_follow_up = command_text is None and active_onboarding
     if command_text is None:
-        if pending_action is None and not active_onboarding:
-            return
-        command_text = message.content.strip()
+        if should_store_message:
+            save_channel_message(
+                discord_user_id,
+                getattr(message.author, "display_name", str(message.author)),
+                channel_id,
+                message.content,
+            )
+        return
+    is_onboarding_follow_up = active_onboarding and not command_text.casefold().startswith(
+        "onboarding "
+    )
 
-    ai_context = build_ai_context(discord_user_id)
+    ai_context = build_ai_context(discord_user_id, channel_id)
     pending_context = build_pending_context(pending_action)
-    save_user_message(discord_user_id, message.content)
+    if should_store_message:
+        save_channel_message(
+            discord_user_id,
+            getattr(message.author, "display_name", str(message.author)),
+            channel_id,
+            message.content,
+        )
 
     normalized_command = command_text.casefold()
 
@@ -614,7 +682,8 @@ async def on_message(message: discord.Message) -> None:
         await message.channel.send(
             "Príkazy: jonas help, jonas ping, jonas register Matúš, "
             "jonas register Ema, jonas users, jonas commitment beh 2, "
-            "jonas commitments, jonas commitments all, "
+            "jonas commitments, jonas commitments all, jonas changes, "
+            "jonas approve change 1, jonas reject change 1, "
             "jonas plan beh piatok 18:00, jonas my week, jonas week, "
             "jonas planning status, jonas done 3 5.2 32, "
             "jonas done 4 drepy 3x12; kliky 3x8, jonas short 3 3.0 20, "
@@ -719,6 +788,24 @@ async def on_message(message: discord.Message) -> None:
         await message.channel.send(_format_users())
         return
 
+    if normalized_command == "changes":
+        await message.channel.send(list_changes())
+        return
+
+    if normalized_command.startswith("approve change ") or normalized_command.startswith(
+        "reject change "
+    ):
+        parts = normalized_command.split()
+        if len(parts) != 3 or not parts[2].isdigit():
+            await message.channel.send(
+                "Použi: jonas approve change <id> alebo jonas reject change <id>"
+            )
+            return
+        vote = "approve" if parts[0] == "approve" else "reject"
+        success, response = vote_change(discord_user_id, int(parts[2]), vote)
+        await message.channel.send(_coach_service_response(success, response, "success"))
+        return
+
     if normalized_command.startswith("commitment "):
         parsed_commitment = _parse_commitment_command(command_text)
         if parsed_commitment is None:
@@ -728,7 +815,7 @@ async def on_message(message: discord.Message) -> None:
             return
 
         workout_type, count_per_week = parsed_commitment
-        success, response = set_commitment(
+        success, response = _request_or_set_commitment(
             str(message.author.id), workout_type, count_per_week
         )
         await message.channel.send(_coach_service_response(success, response, "success"))
@@ -787,8 +874,12 @@ async def on_message(message: discord.Message) -> None:
             return
 
         plan_id, new_day, new_time = parsed_joker
+        resolved, plan_id_or_message = _resolve_plan_id(discord_user_id, plan_id)
+        if not resolved:
+            await message.channel.send(respond_error(str(plan_id_or_message)))
+            return
         success, response = use_joker(
-            str(message.author.id), plan_id, new_day, new_time
+            str(message.author.id), int(plan_id_or_message), new_day, new_time
         )
         await message.channel.send(_coach_service_response(success, response, "joker"))
         return
@@ -813,7 +904,7 @@ async def on_message(message: discord.Message) -> None:
 
         author_name = getattr(message.author, "display_name", str(message.author))
         try:
-            parsed = await _parse_with_ai(
+            parsed = await _route_with_ai(
                 test_text, author_name, ai_context, pending_context
             )
         except Exception:
@@ -855,8 +946,12 @@ async def on_message(message: discord.Message) -> None:
             return
 
         plan_id, result_text = parsed_result
+        resolved, plan_id_or_message = _resolve_plan_id(discord_user_id, plan_id)
+        if not resolved:
+            await message.channel.send(respond_error(str(plan_id_or_message)))
+            return
         success, response = complete_workout(
-            str(message.author.id), plan_id, result_text
+            str(message.author.id), int(plan_id_or_message), result_text
         )
         await message.channel.send(_coach_service_response(success, response, "success"))
         return
@@ -868,8 +963,12 @@ async def on_message(message: discord.Message) -> None:
             return
 
         plan_id, result_text = parsed_result
+        resolved, plan_id_or_message = _resolve_plan_id(discord_user_id, plan_id)
+        if not resolved:
+            await message.channel.send(respond_error(str(plan_id_or_message)))
+            return
         success, response = shorten_workout(
-            str(message.author.id), plan_id, result_text
+            str(message.author.id), int(plan_id_or_message), result_text
         )
         await message.channel.send(
             _coach_service_response(success, response, "shortened")
@@ -882,7 +981,11 @@ async def on_message(message: discord.Message) -> None:
             await message.channel.send(MISSED_FORMAT_MESSAGE)
             return
 
-        success, response = miss_workout(str(message.author.id), plan_id)
+        resolved, plan_id_or_message = _resolve_plan_id(discord_user_id, plan_id)
+        if not resolved:
+            await message.channel.send(respond_error(str(plan_id_or_message)))
+            return
+        success, response = miss_workout(str(message.author.id), int(plan_id_or_message))
         await message.channel.send(_coach_service_response(success, response, "missed"))
         return
 
@@ -892,7 +995,13 @@ async def on_message(message: discord.Message) -> None:
             await message.channel.send(WORKOUT_FORMAT_MESSAGE)
             return
 
-        success, response = get_workout_detail(str(message.author.id), plan_id)
+        resolved, plan_id_or_message = _resolve_plan_id(discord_user_id, plan_id)
+        if not resolved:
+            await message.channel.send(respond_error(str(plan_id_or_message)))
+            return
+        success, response = get_workout_detail(
+            str(message.author.id), int(plan_id_or_message)
+        )
         if success:
             await message.channel.send(respond_stats(response))
         else:
@@ -901,7 +1010,7 @@ async def on_message(message: discord.Message) -> None:
 
     author_name = getattr(message.author, "display_name", str(message.author))
     try:
-        parsed = await _parse_with_ai(
+        router_result = await _route_with_ai(
             command_text, author_name, ai_context, pending_context
         )
     except Exception:
@@ -911,8 +1020,53 @@ async def on_message(message: discord.Message) -> None:
         )
         return
 
-    if parsed is None:
+    if router_result is None:
         await message.channel.send(AI_NOT_CONFIGURED_MESSAGE)
+        return
+
+    route = router_result["route"]
+    if route in {"general_advice", "casual_chat", "app_help", "context_question"}:
+        factual_result = (
+            APP_HELP_TEXT if route == "app_help" else router_result["response_hint"]
+        )
+        await _natural_coach_response(message, route, factual_result)
+        return
+
+    if router_result["needs_clarification"] and route != "tool_action":
+        await message.channel.send(
+            router_result["clarification_question"]
+            or "Potrebujem trochu presnejšie povedať, čo chceš."
+        )
+        return
+
+    parsed = _router_to_parsed(router_result)
+
+    if route == "commitment_change_request":
+        request_id = router_result["tool_args"]["request_id"]
+        vote = router_result["tool_args"]["vote"]
+        if request_id is not None and vote in {"approve", "reject"}:
+            success, response = vote_change(discord_user_id, request_id, vote)
+            await _natural_coach_response(message, "planning", response, success)
+            return
+        if not parsed["workout_type"] or parsed["count_per_week"] is None:
+            await message.channel.send(
+                router_result["clarification_question"]
+                or "Ktorý záväzok chceš zmeniť a na koľko tréningov týždenne?"
+            )
+            return
+        success, response = _request_or_set_commitment(
+            discord_user_id, parsed["workout_type"], parsed["count_per_week"]
+        )
+        await _natural_coach_response(message, "planning", response, success)
+        return
+
+    if route == "unknown":
+        await _natural_coach_response(
+            message,
+            "casual_chat",
+            router_result["response_hint"]
+            or "Neviem presne, čo odo mňa potrebuješ. Skús to povedať konkrétnejšie.",
+        )
         return
 
     if (

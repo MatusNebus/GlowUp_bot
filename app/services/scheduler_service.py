@@ -91,8 +91,8 @@ async def send_post_workout_checks(client, now: datetime) -> None:
 
         await channel.send(
             f"{plan['display_name']}, {_had_workout_form(plan['display_name'])} tréning. "
-            f"Splnené? Zapíš výsledok napríklad: jonas done {plan['id']} <výsledok>, "
-            f"alebo ak to nevyšlo: jonas missed {plan['id']}"
+            f"Splnené? Zapíš výsledok napríklad: jonas done {plan['plan_ref']} <výsledok>, "
+            f"alebo ak to nevyšlo: jonas missed {plan['plan_ref']}"
         )
         with get_connection() as connection:
             connection.execute(
@@ -221,6 +221,7 @@ def get_plans_for_date(target_date: date) -> list[dict]:
             """
             SELECT
                 weekly_plans.id,
+                weekly_plans.user_id,
                 weekly_plans.week_start,
                 weekly_plans.planned_day,
                 weekly_plans.planned_time,
@@ -235,11 +236,16 @@ def get_plans_for_date(target_date: date) -> list[dict]:
             """
         ).fetchall()
 
-    return [
-        dict(row)
-        for row in rows
-        if get_plan_date(row["week_start"], row["planned_day"]) == target_date
-    ]
+    plans = []
+    for row in rows:
+        if get_plan_date(row["week_start"], row["planned_day"]) != target_date:
+            continue
+        plan = dict(row)
+        plan["plan_ref"] = _get_plan_reference(
+            plan["user_id"], plan["week_start"], plan["id"]
+        )
+        plans.append(plan)
+    return plans
 
 
 def get_unanswered_from_previous_day(target_date: date) -> list[dict]:
@@ -298,7 +304,7 @@ def _build_morning_message(target_date: date) -> str:
     lines = ["Dobré ráno. Dnešné tréningy:"]
     for plan in plans:
         lines.append(
-            f"- [{plan['id']}] {plan['display_name']}: "
+            f"- [{plan['plan_ref']}] {plan['display_name']}: "
             f"{plan['workout_type']} o {plan['planned_time']}. "
             f"{_personal_motivation(plan['display_name'])}"
         )
@@ -316,7 +322,7 @@ def _build_evening_message(target_date: date) -> str | None:
     ]
     for plan in plans:
         lines.append(
-            f"- [{plan['id']}] {plan['display_name']}: "
+            f"- [{plan['plan_ref']}] {plan['display_name']}: "
             f"{plan['workout_type']} o {plan['planned_time']}"
         )
     return "\n".join(lines)
@@ -338,6 +344,31 @@ def _get_plans_due_for_check(now: datetime) -> list[dict]:
         if 60 <= elapsed_minutes <= 70:
             due_plans.append(plan)
     return due_plans
+
+
+def _get_plan_reference(user_id: int, week_start: str, plan_id: int) -> int:
+    """Vráti lokálne číslo tréningu v používateľovom týždni."""
+    with get_connection() as connection:
+        rows = connection.execute(
+            """
+            SELECT id, planned_day, planned_time
+            FROM weekly_plans
+            WHERE user_id = ? AND week_start = ?
+            """,
+            (user_id, week_start),
+        ).fetchall()
+    rows = sorted(
+        rows,
+        key=lambda row: (
+            DAY_ORDER.get(row["planned_day"], 99),
+            row["planned_time"],
+            row["id"],
+        ),
+    )
+    for index, row in enumerate(rows, start=1):
+        if row["id"] == plan_id:
+            return index
+    return plan_id
 
 
 async def _send_once(client, key: str, message: str) -> None:

@@ -142,10 +142,11 @@ def add_plan(
             ),
         )
         plan_id = cursor.lastrowid
+        plan_ref = _get_plan_reference(connection, user["id"], plan_id)
 
     return (
         True,
-        f"{user['display_name']} má naplánované [{plan_id}]: "
+        f"{user['display_name']} má naplánované [{plan_ref}]: "
         f"{normalized_type}, {normalized_day} o {planned_time}.",
     )
 
@@ -272,6 +273,8 @@ def _fetch_week_plans(connection, user_id: int | None = None):
         f"""
         SELECT
             weekly_plans.id,
+            users.id AS user_id,
+            users.discord_user_id,
             users.display_name,
             weekly_plans.week_start,
             weekly_plans.workout_type,
@@ -293,17 +296,61 @@ def _fetch_week_plans(connection, user_id: int | None = None):
             row["display_name"],
             DAY_ORDER.get(row["planned_day"], 99),
             row["planned_time"],
+            row["id"],
         ),
     )
 
 
 def _format_week_plans(plans, title: str, include_name: bool) -> str:
     lines = [title]
+    counters: dict[int, int] = {}
     for plan in plans:
+        counters[plan["user_id"]] = counters.get(plan["user_id"], 0) + 1
+        plan_ref = counters[plan["user_id"]]
         owner = f"{plan['display_name']}: " if include_name else ""
         lines.append(
-            f"{owner}[{plan['id']}] "
+            f"{owner}[{plan_ref}] "
             f"{plan['planned_day']} {plan['planned_time']} — "
             f"{plan['workout_type']} — {plan['status']}"
         )
     return "\n".join(lines)
+
+
+def resolve_plan_reference(
+    discord_user_id: str, user_facing_ref: int
+) -> tuple[bool, int | str]:
+    """Preloží týždenné číslo 1..n na interné ID; potom skúsi staré DB ID."""
+    with get_connection() as connection:
+        user = _get_user(connection, discord_user_id)
+        if user is None:
+            return False, "Najprv sa musíš registrovať."
+
+        plans = _fetch_week_plans(connection, user["id"])
+        if 1 <= user_facing_ref <= len(plans):
+            return True, int(plans[user_facing_ref - 1]["id"])
+
+        owned_plan = connection.execute(
+            "SELECT id FROM weekly_plans WHERE id = ? AND user_id = ?",
+            (user_facing_ref, user["id"]),
+        ).fetchone()
+        if owned_plan is not None:
+            return True, int(owned_plan["id"])
+
+    return False, "Taký tréning som nenašiel. Pozri si čísla cez: jonas my week"
+
+
+def get_plan_reference(discord_user_id: str, plan_id: int) -> int:
+    """Vráti používateľské číslo interného tréningu v aktuálnom týždni."""
+    with get_connection() as connection:
+        user = _get_user(connection, discord_user_id)
+        if user is None:
+            return plan_id
+        return _get_plan_reference(connection, user["id"], plan_id)
+
+
+def _get_plan_reference(connection, user_id: int, plan_id: int) -> int:
+    plans = _fetch_week_plans(connection, user_id)
+    for index, plan in enumerate(plans, start=1):
+        if plan["id"] == plan_id:
+            return index
+    return plan_id

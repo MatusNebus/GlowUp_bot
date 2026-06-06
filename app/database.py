@@ -112,11 +112,15 @@ def init_database() -> None:
             CREATE TABLE IF NOT EXISTS message_memory (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 discord_user_id TEXT NOT NULL,
+                author_display_name TEXT,
+                channel_id TEXT,
                 message_text TEXT NOT NULL,
                 created_at TEXT NOT NULL
             )
             """
         )
+        _ensure_column(connection, "message_memory", "author_display_name", "TEXT")
+        _ensure_column(connection, "message_memory", "channel_id", "TEXT")
         connection.execute(
             """
             CREATE TABLE IF NOT EXISTS pending_actions (
@@ -147,3 +151,41 @@ def init_database() -> None:
             )
             """
         )
+        connection.execute(
+            """
+            CREATE TABLE IF NOT EXISTS commitment_change_requests (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                requester_discord_user_id TEXT NOT NULL,
+                target_discord_user_id TEXT NOT NULL,
+                workout_type TEXT NOT NULL,
+                old_count INTEGER NOT NULL,
+                new_count INTEGER NOT NULL,
+                status TEXT NOT NULL DEFAULT 'open',
+                created_at TEXT NOT NULL,
+                resolved_at TEXT
+            )
+            """
+        )
+        connection.execute(
+            """
+            CREATE TABLE IF NOT EXISTS commitment_change_votes (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                request_id INTEGER NOT NULL,
+                voter_discord_user_id TEXT NOT NULL,
+                vote TEXT NOT NULL,
+                created_at TEXT NOT NULL,
+                UNIQUE(request_id, voter_discord_user_id),
+                FOREIGN KEY(request_id) REFERENCES commitment_change_requests(id)
+            )
+            """
+        )
+
+
+def _ensure_column(
+    connection: sqlite3.Connection, table_name: str, column_name: str, definition: str
+) -> None:
+    """Doplní stĺpec do existujúcej SQLite tabuľky bez straty dát."""
+    columns = connection.execute(f"PRAGMA table_info({table_name})").fetchall()
+    if any(column["name"] == column_name for column in columns):
+        return
+    connection.execute(f"ALTER TABLE {table_name} ADD COLUMN {column_name} {definition}")

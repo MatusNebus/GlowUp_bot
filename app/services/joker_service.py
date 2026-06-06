@@ -4,6 +4,7 @@ from app.database import get_connection
 from app.services.planning_service import (
     DAY_ORDER,
     get_current_week_start,
+    get_plan_reference,
     is_valid_time,
     normalize_day,
 )
@@ -152,10 +153,11 @@ def joker_status(discord_user_id: str) -> tuple[bool, str]:
     if joker is None:
         return True, "Žolík tento týždeň ešte máš k dispozícii."
 
+    plan_ref = get_plan_reference(discord_user_id, joker["weekly_plan_id"])
     return (
         True,
         "Žolík už bol tento týždeň použitý na tréning "
-        f"[{joker['weekly_plan_id']}] {joker['workout_type']}: "
+        f"[{plan_ref}] {joker['workout_type']}: "
         f"{joker['old_day']} {joker['old_time']} -> "
         f"{joker['new_day']} {joker['new_time']}.",
     )
