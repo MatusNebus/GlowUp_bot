@@ -12,6 +12,11 @@ from app.services.planning_service import (
     list_my_week,
     weekly_status,
 )
+from app.services.stats_service import (
+    MONTH_FORMAT_MESSAGE,
+    get_all_month_stats,
+    get_user_month_stats,
+)
 from app.services.users_service import list_users, register_user
 from app.services.workout_service import (
     complete_workout,
@@ -180,6 +185,26 @@ def _parse_joker_command(command_text: str) -> tuple[int, str, str] | None:
     return int(plan_id_text), new_day, new_time
 
 
+def _parse_stats_command(command_text: str) -> tuple[bool, str | None] | None:
+    parts = command_text.split()
+    if not parts or parts[0].casefold() not in {"stats", "report"}:
+        return None
+
+    arguments = parts[1:]
+    if not arguments:
+        return False, None
+
+    if arguments[0].casefold() == "all":
+        if len(arguments) > 2:
+            return None
+        return True, arguments[1] if len(arguments) == 2 else None
+
+    if len(arguments) == 1:
+        return False, arguments[0]
+
+    return None
+
+
 @client.event
 async def on_ready() -> None:
     print(f"Jonáš je online ako {client.user}")
@@ -206,7 +231,8 @@ async def on_message(message: discord.Message) -> None:
             "jonas planning status, jonas done 3 5.2 32, "
             "jonas done 4 drepy 3x12; kliky 3x8, jonas short 3 3.0 20, "
             "jonas missed 3, jonas workout 3, jonas joker 3 sobota 10:00, "
-            "jonas joker status"
+            "jonas joker status, jonas stats, jonas stats 2026-06, "
+            "jonas stats all, jonas report all"
         )
         return
 
@@ -288,6 +314,22 @@ async def on_message(message: discord.Message) -> None:
         plan_id, new_day, new_time = parsed_joker
         _, response = use_joker(str(message.author.id), plan_id, new_day, new_time)
         await message.channel.send(response)
+        return
+
+    if normalized_command.startswith("stats") or normalized_command.startswith(
+        "report"
+    ):
+        parsed_stats = _parse_stats_command(command_text)
+        if parsed_stats is None:
+            await message.channel.send(MONTH_FORMAT_MESSAGE)
+            return
+
+        show_all, month = parsed_stats
+        if show_all:
+            await message.channel.send(get_all_month_stats(month))
+        else:
+            _, response = get_user_month_stats(str(message.author.id), month)
+            await message.channel.send(response)
         return
 
     if normalized_command == "done" or normalized_command.startswith("done "):
