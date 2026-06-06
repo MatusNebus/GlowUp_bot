@@ -98,3 +98,12 @@ def init_database() -> None:
             )
             """
         )
+        connection.execute(
+            """
+            CREATE TABLE IF NOT EXISTS notification_log (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                notification_key TEXT UNIQUE NOT NULL,
+                sent_at TEXT NOT NULL
+            )
+            """
+        )

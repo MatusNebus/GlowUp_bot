@@ -12,6 +12,7 @@ from app.services.planning_service import (
     list_my_week,
     weekly_status,
 )
+from app.services.scheduler_service import send_scheduler_test_messages, start_scheduler
 from app.services.stats_service import (
     MONTH_FORMAT_MESSAGE,
     get_all_month_stats,
@@ -208,6 +209,7 @@ def _parse_stats_command(command_text: str) -> tuple[bool, str | None] | None:
 @client.event
 async def on_ready() -> None:
     print(f"Jonáš je online ako {client.user}")
+    start_scheduler(client)
 
 
 @client.event
@@ -232,7 +234,9 @@ async def on_message(message: discord.Message) -> None:
             "jonas done 4 drepy 3x12; kliky 3x8, jonas short 3 3.0 20, "
             "jonas missed 3, jonas workout 3, jonas joker 3 sobota 10:00, "
             "jonas joker status, jonas stats, jonas stats 2026-06, "
-            "jonas stats all, jonas report all"
+            "jonas stats all, jonas report all, jonas test scheduler. "
+            "Automatické správy: nedeľa 19:00 plánovanie, denne 06:00 ranný plán, "
+            "denne 20:00 príprava na zajtra, po tréningu kontrola."
         )
         return
 
@@ -313,6 +317,11 @@ async def on_message(message: discord.Message) -> None:
 
         plan_id, new_day, new_time = parsed_joker
         _, response = use_joker(str(message.author.id), plan_id, new_day, new_time)
+        await message.channel.send(response)
+        return
+
+    if normalized_command == "test scheduler":
+        _, response = await send_scheduler_test_messages(client)
         await message.channel.send(response)
         return
 
