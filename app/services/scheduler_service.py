@@ -45,6 +45,7 @@ async def scheduler_loop(client) -> None:
                 await send_daily_morning_message(client, now)
             if now.hour == 20 and now.minute == 0:
                 await send_evening_preparation_message(client, now)
+            await send_workout_start_reminders(client, now)
             if now.minute % 10 == 0:
                 await send_post_workout_checks(client, now)
             if now.hour == 7 and now.minute == 0:
@@ -77,6 +78,25 @@ async def send_evening_preparation_message(client, now: datetime) -> None:
     message = _build_evening_message(now.date() + timedelta(days=1))
     if message is not None:
         await _send_once(client, key, message)
+
+
+async def send_workout_start_reminders(client, now: datetime) -> None:
+    """V presnej minúte začiatku pripomenie používateľovi naplánovaný tréning."""
+    channel = await get_channel(client)
+    if channel is None:
+        return
+
+    for plan in _get_plans_starting_now(now):
+        key = f"workout_start_plan_{plan['id']}"
+        if was_notification_sent(key):
+            continue
+
+        await channel.send(
+            f"{plan['display_name']}, {_planned_workout_form(plan['display_name'])} "
+            f"{plan['workout_type']} na teraz. Už máš cvičiť. "
+            "Plán nebol návrh, bol to záväzok."
+        )
+        mark_notification_sent(key)
 
 
 async def send_post_workout_checks(client, now: datetime) -> None:
@@ -346,6 +366,17 @@ def _get_plans_due_for_check(now: datetime) -> list[dict]:
     return due_plans
 
 
+def _get_plans_starting_now(now: datetime) -> list[dict]:
+    """Vráti planned/postponed tréningy začínajúce v aktuálnej minúte."""
+    current_time = now.strftime("%H:%M")
+    return [
+        plan
+        for plan in get_plans_for_date(now.date())
+        if plan["status"] in {"planned", "postponed"}
+        and plan["planned_time"] == current_time
+    ]
+
+
 def _get_plan_reference(user_id: int, week_start: str, plan_id: int) -> int:
     """Vráti lokálne číslo tréningu v používateľovom týždni."""
     with get_connection() as connection:
@@ -395,3 +426,9 @@ def _had_workout_form(display_name: str) -> str:
     if display_name.strip().casefold() == "ema":
         return "mala si"
     return "mal si"
+
+
+def _planned_workout_form(display_name: str) -> str:
+    if display_name.strip().casefold() == "ema":
+        return "naplánovala si si"
+    return "naplánoval si si"
