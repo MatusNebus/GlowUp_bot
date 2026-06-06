@@ -81,6 +81,8 @@ Podporované významy:
 - forbidden_walk_replacement: používateľ chce nahradiť tréning prechádzkou/chôdzou/walk
 - ask_matus_decision: nový alebo nejasný typ tréningu vyžaduje rozhodnutie Matúša
 - unknown: nedostatok údajov alebo nejasný zámer
+- všeobecná otázka o tréningu, motivácii, výžive alebo cvičení, ktorá nie je
+  databázovou akciou, má intent="unknown" a raw_summary stručne zhrnie otázku
 
 Normalizácia:
 - dni: pondelok, utorok, streda, stvrtok, piatok, sobota, nedela

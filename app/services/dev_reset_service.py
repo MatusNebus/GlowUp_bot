@@ -1,0 +1,73 @@
+from app.database import get_connection
+
+
+def reset_me(discord_user_id: str) -> tuple[bool, str]:
+    """Vymaže všetky používateľské dáta autora."""
+    with get_connection() as connection:
+        user = connection.execute(
+            "SELECT id, display_name FROM users WHERE discord_user_id = ?",
+            (discord_user_id,),
+        ).fetchone()
+        if user is None:
+            return False, "Tento Discord používateľ nemá uložené dáta."
+
+        _delete_user_data(connection, user["id"], discord_user_id)
+
+    return True, f"Dáta používateľa {user['display_name']} boli zmazané."
+
+
+def reset_user(display_name: str) -> tuple[bool, str]:
+    """Vymaže dáta používateľa podľa display_name."""
+    with get_connection() as connection:
+        users = connection.execute(
+            "SELECT id, discord_user_id, display_name FROM users"
+        ).fetchall()
+        user = next(
+            (
+                row
+                for row in users
+                if row["display_name"].strip().casefold()
+                == display_name.strip().casefold()
+            ),
+            None,
+        )
+        if user is None:
+            return False, f"Používateľ {display_name} neexistuje."
+
+        _delete_user_data(connection, user["id"], user["discord_user_id"])
+
+    return True, f"Dáta používateľa {user['display_name']} boli zmazané."
+
+
+def reset_all() -> tuple[bool, str]:
+    """Vymaže všetky používateľské dáta projektu."""
+    with get_connection() as connection:
+        for table in (
+            "workout_logs",
+            "jokers",
+            "weekly_plans",
+            "commitments",
+            "user_profiles",
+            "message_memory",
+            "pending_actions",
+            "notification_log",
+            "users",
+        ):
+            connection.execute(f"DELETE FROM {table}")
+
+    return True, "Všetky používateľské dáta boli zmazané."
+
+
+def _delete_user_data(connection, user_id: int, discord_user_id: str) -> None:
+    connection.execute("DELETE FROM workout_logs WHERE user_id = ?", (user_id,))
+    connection.execute("DELETE FROM jokers WHERE user_id = ?", (user_id,))
+    connection.execute("DELETE FROM weekly_plans WHERE user_id = ?", (user_id,))
+    connection.execute("DELETE FROM commitments WHERE user_id = ?", (user_id,))
+    connection.execute("DELETE FROM user_profiles WHERE user_id = ?", (user_id,))
+    connection.execute(
+        "DELETE FROM message_memory WHERE discord_user_id = ?", (discord_user_id,)
+    )
+    connection.execute(
+        "DELETE FROM pending_actions WHERE discord_user_id = ?", (discord_user_id,)
+    )
+    connection.execute("DELETE FROM users WHERE id = ?", (user_id,))

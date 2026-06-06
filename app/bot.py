@@ -9,10 +9,31 @@ from app.ai_parser import (
     OpenAIKeyMissingError,
     parse_natural_message,
 )
-from app.config import DISCORD_TOKEN
+from app.config import ADMIN_DISCORD_USER_ID, DISCORD_TOKEN
+from app.services.coach_responder import (
+    generate_coach_reply,
+    respond_error,
+    respond_forbidden_walk,
+    respond_joker,
+    respond_missed,
+    respond_planning_success,
+    respond_shortened,
+    respond_stats,
+    respond_success,
+    respond_unknown,
+)
 from app.services.commitments_service import list_commitments, set_commitment
 from app.services.context_service import build_ai_context, save_user_message
+from app.services.dev_reset_service import reset_all, reset_me, reset_user
 from app.services.joker_service import JOKER_FORMAT_MESSAGE, joker_status, use_joker
+from app.services.onboarding_service import (
+    confirm_onboarding,
+    get_onboarding_status,
+    has_active_onboarding,
+    process_onboarding_answer,
+    reset_onboarding,
+    start_onboarding,
+)
 from app.services.pending_actions_service import (
     build_pending_context,
     create_pending_action,
@@ -221,6 +242,75 @@ def _parse_stats_command(command_text: str) -> tuple[bool, str | None] | None:
     return None
 
 
+def _coach_service_response(success: bool, response: str, kind: str) -> str:
+    if not success:
+        normalized_response = response.casefold()
+        if "prech" in normalized_response:
+            return respond_forbidden_walk()
+        return respond_error(response)
+
+    responders = {
+        "success": respond_success,
+        "shortened": respond_shortened,
+        "missed": respond_missed,
+        "joker": respond_joker,
+        "planning": respond_planning_success,
+        "stats": respond_stats,
+    }
+    return responders[kind](response)
+
+
+def _coach_stats_response(response: str) -> str:
+    if response == MONTH_FORMAT_MESSAGE:
+        return respond_error(response)
+    return respond_stats(response)
+
+
+async def _natural_coach_response(
+    message: discord.Message,
+    event_type: str,
+    factual_result: str,
+    success: bool = True,
+) -> None:
+    if not success:
+        event_type = "forbidden_walk" if "prech" in factual_result.casefold() else "error"
+
+    user_context = f"Používateľ: {getattr(message.author, 'display_name', message.author)}"
+    response = await asyncio.to_thread(
+        generate_coach_reply, event_type, factual_result, user_context
+    )
+    await message.channel.send(response)
+
+
+def _is_admin(discord_user_id: str) -> tuple[bool, str | None]:
+    if not ADMIN_DISCORD_USER_ID:
+        return False, "ADMIN_DISCORD_USER_ID nie je nastavené. Dev reset je vypnutý."
+    if discord_user_id != ADMIN_DISCORD_USER_ID.strip():
+        return False, "Tento príkaz môže použiť iba admin."
+    return True, None
+
+
+def _looks_like_general_advice(message_text: str) -> bool:
+    text = message_text.casefold()
+    keywords = (
+        "čo je",
+        "ako mám",
+        "čo mám",
+        "nechce sa mi",
+        "ťažké nohy",
+        "boles",
+        "zran",
+        "jesť",
+        "výž",
+        "motiv",
+        "výbuš",
+        "zlepšiť",
+        "cvičiť",
+        "behať",
+    )
+    return "?" in message_text or any(keyword in text for keyword in keywords)
+
+
 async def _parse_with_ai(
     message_text: str,
     author_display_name: str,
@@ -248,20 +338,25 @@ async def _execute_ai_intent(message: discord.Message, parsed: dict) -> bool:
 
     if intent == "unknown" and _has_multiple_plan_options(parsed):
         await message.channel.send(
-            "Našiel som viac možností. Pozri si ID cez: jonas my week"
+            respond_unknown("Našiel som viac možností. Pozri si ID cez: jonas my week")
         )
         return False
 
     if intent == "plan_workout":
         if not parsed["day"] or not parsed["time"]:
             await message.channel.send(
-                "Potrebujem deň aj čas. Napíš napríklad: jonas v piatok o 18:00 beh"
+                respond_unknown(
+                    "Potrebujem deň aj čas. Napíš napríklad: "
+                    "jonas v piatok o 18:00 beh"
+                )
             )
             return False
         if not parsed["workout_type"]:
             await message.channel.send(
-                "Rozumiem, že niečo chceš, ale nemám dosť údajov. "
-                "Skús to napísať konkrétnejšie: typ tréningu, deň, čas alebo ID tréningu."
+                respond_unknown(
+                    "Rozumiem, že niečo chceš, ale nemám dosť údajov. "
+                    "Skús to napísať konkrétnejšie: typ tréningu, deň, čas alebo ID tréningu."
+                )
             )
             return False
         success, response = add_plan(
@@ -270,7 +365,7 @@ async def _execute_ai_intent(message: discord.Message, parsed: dict) -> bool:
             parsed["day"],
             parsed["time"],
         )
-        await message.channel.send(response)
+        await _natural_coach_response(message, "planning", response, success)
         return success
 
     if intent in {"log_done", "log_short", "log_missed", "use_joker"}:
@@ -282,7 +377,7 @@ async def _execute_ai_intent(message: discord.Message, parsed: dict) -> bool:
                 )
             else:
                 response = "Potrebujem ID tréningu. Pozri si ho cez: jonas my week"
-            await message.channel.send(response)
+            await message.channel.send(respond_unknown(response))
             return False
 
     if intent == "log_done":
@@ -294,27 +389,29 @@ async def _execute_ai_intent(message: discord.Message, parsed: dict) -> bool:
                 )
             else:
                 response = "Potrebujem aj výsledok tréningu."
-            await message.channel.send(response)
+            await message.channel.send(respond_unknown(response))
             return False
         success, response = complete_workout(
             discord_user_id, parsed["plan_id"], parsed["result_text"]
         )
-        await message.channel.send(response)
+        await _natural_coach_response(message, "success", response, success)
         return success
 
     if intent == "log_short":
         if not parsed["result_text"]:
-            await message.channel.send("Potrebujem aj výsledok skráteného tréningu.")
+            await message.channel.send(
+                respond_unknown("Potrebujem aj výsledok skráteného tréningu.")
+            )
             return False
         success, response = shorten_workout(
             discord_user_id, parsed["plan_id"], parsed["result_text"]
         )
-        await message.channel.send(response)
+        await _natural_coach_response(message, "shortened", response, success)
         return success
 
     if intent == "log_missed":
         success, response = miss_workout(discord_user_id, parsed["plan_id"])
-        await message.channel.send(response)
+        await _natural_coach_response(message, "missed", response, success)
         return success
 
     if intent == "use_joker":
@@ -327,30 +424,32 @@ async def _execute_ai_intent(message: discord.Message, parsed: dict) -> bool:
         success, response = use_joker(
             discord_user_id, parsed["plan_id"], parsed["day"], parsed["time"]
         )
-        await message.channel.send(response)
+        await _natural_coach_response(message, "joker", response, success)
         return success
 
     if intent == "show_my_week":
-        _, response = list_my_week(discord_user_id)
-        await message.channel.send(response)
+        success, response = list_my_week(discord_user_id)
+        await _natural_coach_response(message, "stats", response, success)
         return True
 
     if intent == "show_week":
-        await message.channel.send(list_all_week())
+        await _natural_coach_response(message, "stats", list_all_week())
         return True
 
     if intent == "show_planning_status":
-        _, response = weekly_status(discord_user_id)
-        await message.channel.send(response)
+        success, response = weekly_status(discord_user_id)
+        await _natural_coach_response(message, "stats", response, success)
         return True
 
     if intent == "show_stats":
-        _, response = get_user_month_stats(discord_user_id, parsed["month"])
-        await message.channel.send(response)
+        success, response = get_user_month_stats(discord_user_id, parsed["month"])
+        await _natural_coach_response(message, "stats", response, success)
         return True
 
     if intent == "show_stats_all":
-        await message.channel.send(get_all_month_stats(parsed["month"]))
+        await _natural_coach_response(
+            message, "stats", get_all_month_stats(parsed["month"])
+        )
         return True
 
     if intent == "set_commitment":
@@ -363,14 +462,12 @@ async def _execute_ai_intent(message: discord.Message, parsed: dict) -> bool:
         success, response = set_commitment(
             discord_user_id, parsed["workout_type"], parsed["count_per_week"]
         )
-        await message.channel.send(response)
+        await _natural_coach_response(message, "success", response, success)
         return success
 
     if intent == "forbidden_walk_replacement":
-        await message.channel.send(
-            "Nie. Prechádzka sa podľa pravidiel Couple GlowUp neráta ako tréning "
-            "a nemôže nahradiť plánovaný beh ani posilku. Môže byť bonus alebo "
-            "regenerácia, ale povinný tréning ostáva."
+        await _natural_coach_response(
+            message, "forbidden_walk", respond_forbidden_walk()
         )
         return True
 
@@ -379,10 +476,15 @@ async def _execute_ai_intent(message: discord.Message, parsed: dict) -> bool:
         await message.channel.send(f"Matúš, potrebujem rozhodnutie: {question}")
         return True
 
-    await message.channel.send(
-        "Rozumiem, že niečo chceš, ale nemám dosť údajov. "
-        "Skús to napísať konkrétnejšie: typ tréningu, deň, čas alebo ID tréningu."
-    )
+    if _looks_like_general_advice(message.content):
+        await _natural_coach_response(message, "general_advice", message.content)
+    else:
+        await message.channel.send(
+            respond_unknown(
+                "Rozumiem, že niečo chceš, ale nemám dosť údajov. "
+                "Skús to napísať konkrétnejšie: typ tréningu, deň, čas alebo ID tréningu."
+            )
+        )
     return False
 
 
@@ -490,8 +592,10 @@ async def on_message(message: discord.Message) -> None:
     command_text = _extract_command_text(message)
     is_pending_follow_up = command_text is None
     pending_action = get_latest_pending_action(discord_user_id)
+    active_onboarding = has_active_onboarding(discord_user_id)
+    is_onboarding_follow_up = command_text is None and active_onboarding
     if command_text is None:
-        if pending_action is None:
+        if pending_action is None and not active_onboarding:
             return
         command_text = message.content.strip()
 
@@ -500,6 +604,11 @@ async def on_message(message: discord.Message) -> None:
     save_user_message(discord_user_id, message.content)
 
     normalized_command = command_text.casefold()
+
+    if is_onboarding_follow_up and pending_action is None:
+        _, response = process_onboarding_answer(discord_user_id, command_text)
+        await message.channel.send(response)
+        return
 
     if normalized_command == "help":
         await message.channel.send(
@@ -512,7 +621,9 @@ async def on_message(message: discord.Message) -> None:
             "jonas missed 3, jonas workout 3, jonas joker 3 sobota 10:00, "
             "jonas joker status, jonas stats, jonas stats 2026-06, "
             "jonas stats all, jonas report all, jonas test scheduler. "
-            "Debug: jonas pending. "
+            "Onboarding: jonas onboarding start, jonas onboarding status, "
+            "jonas onboarding confirm. Debug: jonas pending, "
+            "jonas coach test success. "
             "Automatické správy: nedeľa 19:00 plánovanie, denne 06:00 ranný plán, "
             "denne 20:00 príprava na zajtra, po tréningu kontrola. "
             "Prirodzený jazyk: jonas v piatok o 18:00 beh; "
@@ -525,10 +636,83 @@ async def on_message(message: discord.Message) -> None:
         await message.channel.send("Som online. Žiadne výhovorky.")
         return
 
+    if normalized_command.startswith("dev reset"):
+        is_admin, error = _is_admin(discord_user_id)
+        if not is_admin:
+            await message.channel.send(respond_error(error))
+            return
+
+        if normalized_command == "dev reset me":
+            success, response = reset_me(discord_user_id)
+        elif normalized_command == "dev reset all":
+            success, response = reset_all()
+        elif normalized_command.startswith("dev reset user "):
+            display_name = command_text[len("dev reset user ") :].strip()
+            success, response = reset_user(display_name)
+        else:
+            success = False
+            response = (
+                "Formát: jonas dev reset me, jonas dev reset all alebo "
+                "jonas dev reset user <meno>"
+            )
+
+        if success:
+            await message.channel.send(
+                f"{response} Reset je hotový. Dáta sú preč. "
+                "Používateľ môže začať onboarding odznova."
+            )
+        else:
+            await message.channel.send(respond_error(response))
+        return
+
+    if normalized_command == "onboarding start":
+        success, response = start_onboarding(discord_user_id)
+        await message.channel.send(response if success else respond_error(response))
+        return
+
+    if normalized_command == "onboarding status":
+        success, response = get_onboarding_status(discord_user_id)
+        await message.channel.send(response if success else respond_error(response))
+        return
+
+    if normalized_command == "onboarding reset":
+        success, response = reset_onboarding(discord_user_id)
+        await message.channel.send(response if success else respond_error(response))
+        return
+
+    if normalized_command == "onboarding confirm":
+        success, response = confirm_onboarding(discord_user_id)
+        await message.channel.send(
+            _coach_service_response(success, response, "success")
+        )
+        return
+
+    if normalized_command.startswith("coach test "):
+        payload = command_text[len("coach test ") :].strip()
+        event_type, _, detail = payload.partition(" ")
+        if event_type == "advice":
+            event_type = "general_advice"
+            factual_result = detail or "Čo je najlepšie na výbušnosť?"
+        elif event_type in {"success", "missed"}:
+            factual_result = (
+                "Testovací tréning bol splnený."
+                if event_type == "success"
+                else "Testovací tréning bol vynechaný."
+            )
+        else:
+            await message.channel.send(
+                "Použi: jonas coach test success, jonas coach test missed alebo "
+                "jonas coach test advice výbušnosť"
+            )
+            return
+
+        await _natural_coach_response(message, event_type, factual_result)
+        return
+
     if normalized_command.startswith("register "):
         display_name = command_text[len("register ") :].strip()
-        _, response = register_user(str(message.author.id), display_name)
-        await message.channel.send(response)
+        success, response = register_user(str(message.author.id), display_name)
+        await message.channel.send(_coach_service_response(success, response, "success"))
         return
 
     if normalized_command == "users":
@@ -544,10 +728,10 @@ async def on_message(message: discord.Message) -> None:
             return
 
         workout_type, count_per_week = parsed_commitment
-        _, response = set_commitment(
+        success, response = set_commitment(
             str(message.author.id), workout_type, count_per_week
         )
-        await message.channel.send(response)
+        await message.channel.send(_coach_service_response(success, response, "success"))
         return
 
     if normalized_command == "commitments":
@@ -559,8 +743,10 @@ async def on_message(message: discord.Message) -> None:
         return
 
     if normalized_command == "planning status":
-        _, response = weekly_status(str(message.author.id))
-        await message.channel.send(response)
+        success, response = weekly_status(str(message.author.id))
+        await message.channel.send(
+            respond_stats(response) if success else respond_error(response)
+        )
         return
 
     if normalized_command == "plan" or normalized_command.startswith("plan "):
@@ -570,24 +756,28 @@ async def on_message(message: discord.Message) -> None:
             return
 
         workout_type, planned_day, planned_time = parsed_plan
-        _, response = add_plan(
+        success, response = add_plan(
             str(message.author.id), workout_type, planned_day, planned_time
         )
-        await message.channel.send(response)
+        await message.channel.send(_coach_service_response(success, response, "planning"))
         return
 
     if normalized_command == "my week":
-        _, response = list_my_week(str(message.author.id))
-        await message.channel.send(response)
+        success, response = list_my_week(str(message.author.id))
+        await message.channel.send(
+            respond_stats(response) if success else respond_error(response)
+        )
         return
 
     if normalized_command == "week":
-        await message.channel.send(list_all_week())
+        await message.channel.send(respond_stats(list_all_week()))
         return
 
     if normalized_command == "joker status":
-        _, response = joker_status(str(message.author.id))
-        await message.channel.send(response)
+        success, response = joker_status(str(message.author.id))
+        await message.channel.send(
+            respond_stats(response) if success else respond_error(response)
+        )
         return
 
     if normalized_command == "joker" or normalized_command.startswith("joker "):
@@ -597,13 +787,15 @@ async def on_message(message: discord.Message) -> None:
             return
 
         plan_id, new_day, new_time = parsed_joker
-        _, response = use_joker(str(message.author.id), plan_id, new_day, new_time)
-        await message.channel.send(response)
+        success, response = use_joker(
+            str(message.author.id), plan_id, new_day, new_time
+        )
+        await message.channel.send(_coach_service_response(success, response, "joker"))
         return
 
     if normalized_command == "test scheduler":
-        _, response = await send_scheduler_test_messages(client)
-        await message.channel.send(response)
+        success, response = await send_scheduler_test_messages(client)
+        await message.channel.send(_coach_service_response(success, response, "success"))
         return
 
     if normalized_command == "pending":
@@ -648,10 +840,12 @@ async def on_message(message: discord.Message) -> None:
 
         show_all, month = parsed_stats
         if show_all:
-            await message.channel.send(get_all_month_stats(month))
+            await message.channel.send(_coach_stats_response(get_all_month_stats(month)))
         else:
-            _, response = get_user_month_stats(str(message.author.id), month)
-            await message.channel.send(response)
+            success, response = get_user_month_stats(str(message.author.id), month)
+            await message.channel.send(
+                _coach_stats_response(response) if success else respond_error(response)
+            )
         return
 
     if normalized_command == "done" or normalized_command.startswith("done "):
@@ -661,8 +855,10 @@ async def on_message(message: discord.Message) -> None:
             return
 
         plan_id, result_text = parsed_result
-        _, response = complete_workout(str(message.author.id), plan_id, result_text)
-        await message.channel.send(response)
+        success, response = complete_workout(
+            str(message.author.id), plan_id, result_text
+        )
+        await message.channel.send(_coach_service_response(success, response, "success"))
         return
 
     if normalized_command == "short" or normalized_command.startswith("short "):
@@ -672,8 +868,12 @@ async def on_message(message: discord.Message) -> None:
             return
 
         plan_id, result_text = parsed_result
-        _, response = shorten_workout(str(message.author.id), plan_id, result_text)
-        await message.channel.send(response)
+        success, response = shorten_workout(
+            str(message.author.id), plan_id, result_text
+        )
+        await message.channel.send(
+            _coach_service_response(success, response, "shortened")
+        )
         return
 
     if normalized_command == "missed" or normalized_command.startswith("missed "):
@@ -682,8 +882,8 @@ async def on_message(message: discord.Message) -> None:
             await message.channel.send(MISSED_FORMAT_MESSAGE)
             return
 
-        _, response = miss_workout(str(message.author.id), plan_id)
-        await message.channel.send(response)
+        success, response = miss_workout(str(message.author.id), plan_id)
+        await message.channel.send(_coach_service_response(success, response, "missed"))
         return
 
     if normalized_command == "workout" or normalized_command.startswith("workout "):
@@ -692,8 +892,11 @@ async def on_message(message: discord.Message) -> None:
             await message.channel.send(WORKOUT_FORMAT_MESSAGE)
             return
 
-        _, response = get_workout_detail(str(message.author.id), plan_id)
-        await message.channel.send(response)
+        success, response = get_workout_detail(str(message.author.id), plan_id)
+        if success:
+            await message.channel.send(respond_stats(response))
+        else:
+            await message.channel.send(respond_error(response))
         return
 
     author_name = getattr(message.author, "display_name", str(message.author))
