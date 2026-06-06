@@ -107,3 +107,13 @@ def init_database() -> None:
             )
             """
         )
+        connection.execute(
+            """
+            CREATE TABLE IF NOT EXISTS message_memory (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                discord_user_id TEXT NOT NULL,
+                message_text TEXT NOT NULL,
+                created_at TEXT NOT NULL
+            )
+            """
+        )

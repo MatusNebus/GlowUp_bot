@@ -90,7 +90,18 @@ Normalizácia:
 - posilka/fitness je workout_type="posilka"
 - domáci tréning je workout_type="domaci_trening"
 - pri výsledku zachovaj užitočné údaje v result_text, napr. "5.2 km za 32 min"
-- ak správa potrebuje ID, ale neobsahuje ho, nechaj plan_id=null
+- na vyriešenie odkazov vždy použi KONTEXT Z DATABÁZY:
+  - "sobotný beh" je beh v sobotu
+  - "dnešný tréning" je tréning označený DNES
+  - "zajtrajší tréning" je tréning označený ZAJTRA
+  - "posilka vo štvrtok" je posilka v deň stvrtok
+  - "to, čo som chcel predtým" odkazuje na poslednú relevantnú predchádzajúcu správu
+- ak aktuálna správa doplní plan_id a odkazuje na predchádzajúcu požiadavku,
+  spoj plan_id s intentom, dňom, časom alebo výsledkom z poslednej relevantnej správy
+- ak opis jednoznačne zodpovedá práve jednému tréningu v pláne, nastav jeho plan_id
+- ak opis zodpovedá viacerým tréningom, nastav intent="unknown", plan_id=null
+  a v raw_summary jasne napíš, že existuje viac možných tréningov
+- ak správa potrebuje ID a kontext ho nevie jednoznačne určiť, nechaj plan_id=null
 - ak nový typ tréningu nie je jasne známy, použi ask_matus_decision,
   needs_matus_decision=true a napíš stručnú decision_question
 - pri ostatných intentoch je needs_matus_decision=false
@@ -101,7 +112,9 @@ class OpenAIKeyMissingError(RuntimeError):
     pass
 
 
-def parse_natural_message(message_text: str, author_display_name: str) -> dict:
+def parse_natural_message(
+    message_text: str, author_display_name: str, context_text: str = ""
+) -> dict:
     """Preloží ľudskú správu na pevný JSON intent bez vykonania akcie."""
     if not OPENAI_API_KEY:
         raise OpenAIKeyMissingError(AI_NOT_CONFIGURED_MESSAGE)
@@ -113,7 +126,8 @@ def parse_natural_message(message_text: str, author_display_name: str) -> dict:
         input=(
             f"Dnešný dátum: {date.today().isoformat()}\n"
             f"Autor správy: {author_display_name}\n"
-            f"Správa: {message_text}"
+            f"Správa: {message_text}\n\n"
+            f"{context_text}"
         ),
         text={
             "format": {

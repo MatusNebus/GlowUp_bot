@@ -11,6 +11,7 @@ from app.ai_parser import (
 )
 from app.config import DISCORD_TOKEN
 from app.services.commitments_service import list_commitments, set_commitment
+from app.services.context_service import build_ai_context, save_user_message
 from app.services.joker_service import JOKER_FORMAT_MESSAGE, joker_status, use_joker
 from app.services.planning_service import (
     PLAN_FORMAT_MESSAGE,
@@ -213,10 +214,12 @@ def _parse_stats_command(command_text: str) -> tuple[bool, str | None] | None:
     return None
 
 
-async def _parse_with_ai(message_text: str, author_display_name: str) -> dict | None:
+async def _parse_with_ai(
+    message_text: str, author_display_name: str, context_text: str
+) -> dict | None:
     try:
         return await asyncio.to_thread(
-            parse_natural_message, message_text, author_display_name
+            parse_natural_message, message_text, author_display_name, context_text
         )
     except OpenAIKeyMissingError:
         return None
@@ -228,6 +231,12 @@ async def _parse_with_ai(message_text: str, author_display_name: str) -> dict | 
 async def _execute_ai_intent(message: discord.Message, parsed: dict) -> None:
     discord_user_id = str(message.author.id)
     intent = parsed["intent"]
+
+    if intent == "unknown" and _has_multiple_plan_options(parsed):
+        await message.channel.send(
+            "Našiel som viac možností. Pozri si ID cez: jonas my week"
+        )
+        return
 
     if intent == "plan_workout":
         if not parsed["day"] or not parsed["time"]:
@@ -252,9 +261,14 @@ async def _execute_ai_intent(message: discord.Message, parsed: dict) -> None:
 
     if intent in {"log_done", "log_short", "log_missed", "use_joker"}:
         if parsed["plan_id"] is None:
-            await message.channel.send(
-                "Potrebujem ID tréningu. Pozri si ho cez: jonas my week"
-            )
+            if _has_workout_description(message.content, parsed):
+                response = (
+                    "Skúsim to nájsť podľa plánu, ale neviem to určiť jednoznačne. "
+                    "Pozri si ID cez: jonas my week"
+                )
+            else:
+                response = "Potrebujem ID tréningu. Pozri si ho cez: jonas my week"
+            await message.channel.send(response)
             return
 
     if intent == "log_done":
@@ -357,6 +371,37 @@ async def _execute_ai_intent(message: discord.Message, parsed: dict) -> None:
     )
 
 
+def _has_multiple_plan_options(parsed: dict) -> bool:
+    summary = parsed.get("raw_summary", "").casefold()
+    return "viac" in summary and any(
+        word in summary for word in ("možností", "možné", "tréningov", "plan")
+    )
+
+
+def _has_workout_description(message_text: str, parsed: dict) -> bool:
+    if parsed.get("workout_type") or parsed.get("day") or parsed.get("time"):
+        return True
+
+    normalized_text = message_text.casefold()
+    descriptive_words = (
+        "tréning",
+        "beh",
+        "posilk",
+        "dnes",
+        "zajtra",
+        "pondel",
+        "utor",
+        "stred",
+        "štvrt",
+        "stvrt",
+        "piatok",
+        "sobot",
+        "nedeľ",
+        "nedel",
+    )
+    return any(word in normalized_text for word in descriptive_words)
+
+
 @client.event
 async def on_ready() -> None:
     print(f"Jonáš je online ako {client.user}")
@@ -372,6 +417,10 @@ async def on_message(message: discord.Message) -> None:
     command_text = _extract_command_text(message)
     if command_text is None:
         return
+
+    discord_user_id = str(message.author.id)
+    ai_context = build_ai_context(discord_user_id)
+    save_user_message(discord_user_id, message.content)
 
     normalized_command = command_text.casefold()
 
@@ -490,7 +539,7 @@ async def on_message(message: discord.Message) -> None:
 
         author_name = getattr(message.author, "display_name", str(message.author))
         try:
-            parsed = await _parse_with_ai(test_text, author_name)
+            parsed = await _parse_with_ai(test_text, author_name, ai_context)
         except Exception:
             await message.channel.send(
                 "OpenAI parser teraz neodpovedal. Skús to znova o chvíľu."
@@ -565,7 +614,7 @@ async def on_message(message: discord.Message) -> None:
 
     author_name = getattr(message.author, "display_name", str(message.author))
     try:
-        parsed = await _parse_with_ai(command_text, author_name)
+        parsed = await _parse_with_ai(command_text, author_name, ai_context)
     except Exception:
         await message.channel.send(
             "OpenAI parser teraz neodpovedal. Tvrdé príkazy stále fungujú cez: "
