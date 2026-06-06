@@ -117,3 +117,17 @@ def init_database() -> None:
             )
             """
         )
+        connection.execute(
+            """
+            CREATE TABLE IF NOT EXISTS pending_actions (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                discord_user_id TEXT NOT NULL,
+                intent TEXT NOT NULL,
+                original_message TEXT NOT NULL,
+                missing_fields TEXT NOT NULL,
+                parsed_json TEXT NOT NULL,
+                created_at TEXT NOT NULL,
+                is_resolved INTEGER NOT NULL DEFAULT 0
+            )
+            """
+        )

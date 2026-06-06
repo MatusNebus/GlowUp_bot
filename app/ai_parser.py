@@ -98,6 +98,10 @@ Normalizácia:
   - "to, čo som chcel predtým" odkazuje na poslednú relevantnú predchádzajúcu správu
 - ak aktuálna správa doplní plan_id a odkazuje na predchádzajúcu požiadavku,
   spoj plan_id s intentom, dňom, časom alebo výsledkom z poslednej relevantnej správy
+- ak je priložená OTVORENÁ PENDING AKCIA a nová správa dopĺňa jej chýbajúce údaje,
+  spoj pôvodný parsed JSON s novou správou a vráť kompletný pôvodný intent
+- ak nová správa s pending akciou nesúvisí, pending akciu úplne ignoruj a parsuj
+  novú správu samostatne
 - ak opis jednoznačne zodpovedá práve jednému tréningu v pláne, nastav jeho plan_id
 - ak opis zodpovedá viacerým tréningom, nastav intent="unknown", plan_id=null
   a v raw_summary jasne napíš, že existuje viac možných tréningov
@@ -113,7 +117,10 @@ class OpenAIKeyMissingError(RuntimeError):
 
 
 def parse_natural_message(
-    message_text: str, author_display_name: str, context_text: str = ""
+    message_text: str,
+    author_display_name: str,
+    context_text: str = "",
+    pending_action_text: str = "",
 ) -> dict:
     """Preloží ľudskú správu na pevný JSON intent bez vykonania akcie."""
     if not OPENAI_API_KEY:
@@ -127,7 +134,8 @@ def parse_natural_message(
             f"Dnešný dátum: {date.today().isoformat()}\n"
             f"Autor správy: {author_display_name}\n"
             f"Správa: {message_text}\n\n"
-            f"{context_text}"
+            f"{context_text}\n\n"
+            f"{pending_action_text}"
         ),
         text={
             "format": {
