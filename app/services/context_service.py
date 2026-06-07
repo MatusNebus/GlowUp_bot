@@ -114,6 +114,23 @@ def build_ai_context(
             """,
             (user["id"], week_start),
         ).fetchone()
+        open_changes = connection.execute(
+            """
+            SELECT id, target_discord_user_id, workout_type, old_count, new_count
+            FROM commitment_change_requests
+            WHERE status = 'open'
+            ORDER BY id ASC
+            """
+        ).fetchall()
+        open_replacements = connection.execute(
+            """
+            SELECT id, replacement_workout_type, replacement_day,
+                   replacement_time, reason
+            FROM workout_replacement_requests
+            WHERE status = 'open'
+            ORDER BY id ASC
+            """
+        ).fetchall()
 
     enriched_plans = []
     monday = date.fromisoformat(week_start)
@@ -150,6 +167,8 @@ def build_ai_context(
         commitments,
         joker,
         memories,
+        open_changes,
+        open_replacements,
     )
 
 
@@ -161,6 +180,8 @@ def _format_context(
     commitments,
     joker,
     memories,
+    open_changes=(),
+    open_replacements=(),
 ) -> str:
     lines = [
         "KONTEXT PRE AI - používaj ho iba na pochopenie správy:",
@@ -198,6 +219,28 @@ def _format_context(
             f"- použitý na interné_id={joker['weekly_plan_id']}, "
             f"nový termín={joker['new_day']} {joker['new_time']}"
         )
+
+    lines.extend(["", "Otvorené návrhy zmien záväzkov:"])
+    if open_changes:
+        for change in open_changes:
+            lines.append(
+                f"- request_id={change['id']}; typ={change['workout_type']}; "
+                f"{change['old_count']}x -> {change['new_count']}x"
+            )
+    else:
+        lines.append("- žiadne")
+
+    lines.extend(["", "Otvorené návrhy náhrad tréningov:"])
+    if open_replacements:
+        for replacement in open_replacements:
+            lines.append(
+                f"- request_id={replacement['id']}; náhrada="
+                f"{replacement['replacement_workout_type']} "
+                f"{replacement['replacement_day']} {replacement['replacement_time']}; "
+                f"dôvod={replacement['reason']}"
+            )
+    else:
+        lines.append("- žiadne")
 
     lines.extend(["", "Posledné správy v kanáli, najnovšia prvá:"])
     if memories:

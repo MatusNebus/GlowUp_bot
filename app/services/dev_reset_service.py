@@ -43,16 +43,20 @@ def reset_all() -> tuple[bool, str]:
     """Vymaže všetky používateľské dáta projektu."""
     with get_connection() as connection:
         for table in (
+            "workout_replacement_votes",
+            "workout_replacement_requests",
             "commitment_change_votes",
             "commitment_change_requests",
             "workout_logs",
             "jokers",
             "weekly_plans",
             "commitments",
+            "onboarding_sessions",
             "user_profiles",
             "message_memory",
             "pending_actions",
             "notification_log",
+            "approved_activity_types",
             "users",
         ):
             connection.execute(f"DELETE FROM {table}")
@@ -61,6 +65,35 @@ def reset_all() -> tuple[bool, str]:
 
 
 def _delete_user_data(connection, user_id: int, discord_user_id: str) -> None:
+    replacement_ids = connection.execute(
+        """
+        SELECT id FROM workout_replacement_requests
+        WHERE requester_discord_user_id = ?
+           OR original_weekly_plan_id IN (
+               SELECT id FROM weekly_plans WHERE user_id = ?
+           )
+        """,
+        (discord_user_id, user_id),
+    ).fetchall()
+    for request in replacement_ids:
+        connection.execute(
+            "DELETE FROM workout_replacement_votes WHERE request_id = ?",
+            (request["id"],),
+        )
+    connection.execute(
+        """
+        DELETE FROM workout_replacement_requests
+        WHERE requester_discord_user_id = ?
+           OR original_weekly_plan_id IN (
+               SELECT id FROM weekly_plans WHERE user_id = ?
+           )
+        """,
+        (discord_user_id, user_id),
+    )
+    connection.execute(
+        "DELETE FROM workout_replacement_votes WHERE voter_discord_user_id = ?",
+        (discord_user_id,),
+    )
     request_ids = connection.execute(
         """
         SELECT id FROM commitment_change_requests
@@ -87,6 +120,9 @@ def _delete_user_data(connection, user_id: int, discord_user_id: str) -> None:
     connection.execute("DELETE FROM jokers WHERE user_id = ?", (user_id,))
     connection.execute("DELETE FROM weekly_plans WHERE user_id = ?", (user_id,))
     connection.execute("DELETE FROM commitments WHERE user_id = ?", (user_id,))
+    connection.execute(
+        "DELETE FROM onboarding_sessions WHERE discord_user_id = ?", (discord_user_id,)
+    )
     connection.execute("DELETE FROM user_profiles WHERE user_id = ?", (user_id,))
     connection.execute(
         "DELETE FROM message_memory WHERE discord_user_id = ?", (discord_user_id,)

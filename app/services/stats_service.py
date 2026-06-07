@@ -101,6 +101,7 @@ def get_all_month_stats(month: str | None = None) -> str:
         "completed": sum(stats["completed_count"] for stats in stats_by_user),
         "shortened": sum(stats["shortened_count"] for stats in stats_by_user),
         "missed": sum(stats["missed_count"] for stats in stats_by_user),
+        "replaced": sum(stats["replaced_count"] for stats in stats_by_user),
         "run_km": sum(stats["run_km_total"] for stats in stats_by_user),
         "run_time": sum(stats["run_time_total"] for stats in stats_by_user),
         "sets": sum(stats["set_count_total"] for stats in stats_by_user),
@@ -117,6 +118,7 @@ def get_all_month_stats(month: str | None = None) -> str:
         f"Splnené: {totals['completed']}",
         f"Skrátené: {totals['shortened']}",
         f"Vynechané: {totals['missed']}",
+        f"Nahradené: {totals['replaced']}",
         f"Beh spolu: {_format_number(totals['run_km'])} km / "
         f"{_format_number(totals['run_time'])} min",
         f"Série spolu: {totals['sets']}",
@@ -169,7 +171,8 @@ def _calculate_user_stats(connection, user: dict, month: str) -> dict:
 
     run_km_total = sum((plan["distance_km"] or 0) for plan in run_plans)
     run_time_total = sum((plan["duration_minutes"] or 0) for plan in run_plans)
-    planned_count = len(plans)
+    replaced_count = statuses.count("replaced")
+    planned_count = len([plan for plan in plans if plan["status"] != "replaced"])
     completed_count = statuses.count("completed")
     shortened_count = statuses.count("shortened")
     missed_count = statuses.count("missed")
@@ -185,6 +188,7 @@ def _calculate_user_stats(connection, user: dict, month: str) -> dict:
         "missed_count": missed_count,
         "unanswered_count": statuses.count("unanswered"),
         "postponed_count": statuses.count("postponed"),
+        "replaced_count": replaced_count,
         "joker_count": _get_joker_count(connection, user["id"], month),
         "run_count": len(run_plans),
         "run_km_total": run_km_total,
@@ -277,6 +281,7 @@ def _format_user_report(stats: dict, month: str) -> str:
         f"Vynechané: {stats['missed_count']}",
         f"Nezodpovedané: {stats['unanswered_count']}",
         f"Odložené: {stats['postponed_count']}",
+        f"Nahradené: {stats['replaced_count']}",
         f"Použité žolíky: {stats['joker_count']}",
         f"Úspešnosť: {stats['completion_rate']:.1f} %",
         "",

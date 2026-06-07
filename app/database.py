@@ -153,6 +153,29 @@ def init_database() -> None:
         )
         connection.execute(
             """
+            CREATE TABLE IF NOT EXISTS onboarding_sessions (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                discord_user_id TEXT UNIQUE NOT NULL,
+                last_answer TEXT,
+                proposed_commitments TEXT,
+                is_active INTEGER NOT NULL DEFAULT 1,
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL
+            )
+            """
+        )
+        connection.execute(
+            """
+            CREATE TABLE IF NOT EXISTS approved_activity_types (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                workout_type TEXT UNIQUE NOT NULL,
+                approved_by_discord_user_id TEXT NOT NULL,
+                approved_at TEXT NOT NULL
+            )
+            """
+        )
+        connection.execute(
+            """
             CREATE TABLE IF NOT EXISTS commitment_change_requests (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 requester_discord_user_id TEXT NOT NULL,
@@ -176,6 +199,36 @@ def init_database() -> None:
                 created_at TEXT NOT NULL,
                 UNIQUE(request_id, voter_discord_user_id),
                 FOREIGN KEY(request_id) REFERENCES commitment_change_requests(id)
+            )
+            """
+        )
+        connection.execute(
+            """
+            CREATE TABLE IF NOT EXISTS workout_replacement_requests (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                requester_discord_user_id TEXT NOT NULL,
+                original_weekly_plan_id INTEGER NOT NULL,
+                replacement_workout_type TEXT NOT NULL,
+                replacement_day TEXT NOT NULL,
+                replacement_time TEXT NOT NULL,
+                reason TEXT NOT NULL,
+                status TEXT NOT NULL DEFAULT 'open',
+                created_at TEXT NOT NULL,
+                resolved_at TEXT,
+                FOREIGN KEY(original_weekly_plan_id) REFERENCES weekly_plans(id)
+            )
+            """
+        )
+        connection.execute(
+            """
+            CREATE TABLE IF NOT EXISTS workout_replacement_votes (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                request_id INTEGER NOT NULL,
+                voter_discord_user_id TEXT NOT NULL,
+                vote TEXT NOT NULL,
+                created_at TEXT NOT NULL,
+                UNIQUE(request_id, voter_discord_user_id),
+                FOREIGN KEY(request_id) REFERENCES workout_replacement_requests(id)
             )
             """
         )

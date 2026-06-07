@@ -1,126 +1,111 @@
+import json
 import re
+import unicodedata
 from datetime import datetime, timezone
 
 from app.database import get_connection
 from app.services.commitments_service import set_commitment
 
 
-QUESTIONS = {
-    "goal": (
-        "Aký je tvoj hlavný cieľ? Kondícia, sila, chudnutie, pravidelnosť, "
-        "výbušnosť alebo kombinácia?"
-    ),
-    "level": (
-        "Aká je tvoja aktuálna úroveň? Začiatočník, mierne pokročilý alebo pokročilý?"
-    ),
-    "preferred_activities": (
-        "Aké aktivity chceš robiť? Beh, posilka, domáci tréning, bicykel, "
-        "plávanie, beachvolejbal..."
-    ),
-    "limitations": "Máš nejaké zranenia alebo obmedzenia? Ak nie, napíš: nemám.",
-    "weekly_capacity": "Koľko tréningov týždenne realisticky zvládneš?",
-}
-FIELDS = tuple(QUESTIONS)
+WELCOME_MESSAGE = """Vitaj v Couple GlowUp.
+
+Funguje to jednoducho:
+
+1. Najprv si nastavíš týždenný záväzok, napríklad 2x beh a 2x posilka.
+2. Tento počet sa počas nedeľného plánovania neznižuje.
+3. V nedeľu večer si len vyberieš presné dni a časy tréningov.
+4. Po tréningu zapíšeš výsledok.
+5. Každý má 1 žolíka týždenne na posun tréningu maximálne o 1 deň.
+6. Prechádzka sa neráta ako tréning.
+
+Napíš mi jednou vetou, aké tréningy chceš mať a koľkokrát týždenne.
+Napríklad: chcem 2x beh a 2x posilku."""
+
+UNCLEAR_MESSAGE = (
+    "Potrebujem konkrétny týždenný záväzok. Napíš napríklad: "
+    "chcem 2x beh a 2x posilku. Ak chceš úplný základ, odporúčam "
+    "2x beh a 1x domáci tréning."
+)
+
 ACTIVITY_ALIASES = {
-    "beh": ("beh", "beha"),
-    "posilka": ("posilka", "fitness", "sil"),
-    "domaci_trening": ("domáci", "domaci"),
-    "bicykel": ("bicykel", "bike"),
-    "plavanie": ("plávanie", "plavanie"),
-    "beachvolejbal": ("beachvolejbal", "beach", "volejbal"),
+    "beh": ("beh", "behy", "behat"),
+    "posilka": ("posilka", "posilku", "silovy trening", "gym"),
+    "domaci_trening": (
+        "domaci trening",
+        "cvicenie doma",
+        "vlastna vaha",
+    ),
+    "bicykel": ("bicykel", "cyklistika"),
+    "plavanie": ("plavanie",),
+    "beachvolejbal": ("beachvolejbal", "beach volejbal"),
 }
 
 
 def start_onboarding(discord_user_id: str) -> tuple[bool, str]:
-    user = _get_user(discord_user_id)
-    if user is None:
+    """Spustí krátky onboarding a vymaže starý nepotvrdený návrh."""
+    if _get_user(discord_user_id) is None:
         return False, "Najprv sa zaregistruj cez: jonas register <meno>"
 
     now = datetime.now(timezone.utc).isoformat()
     with get_connection() as connection:
         connection.execute(
             """
-            INSERT INTO user_profiles (user_id, created_at, updated_at)
-            VALUES (?, ?, ?)
-            ON CONFLICT(user_id) DO UPDATE SET
-                goal = NULL,
-                level = NULL,
-                preferred_activities = NULL,
-                limitations = NULL,
-                weekly_capacity = NULL,
+            INSERT INTO onboarding_sessions (
+                discord_user_id, last_answer, proposed_commitments,
+                is_active, created_at, updated_at
+            )
+            VALUES (?, NULL, NULL, 1, ?, ?)
+            ON CONFLICT(discord_user_id) DO UPDATE SET
+                last_answer = NULL,
+                proposed_commitments = NULL,
+                is_active = 1,
                 updated_at = excluded.updated_at
             """,
-            (user["id"], now, now),
+            (discord_user_id, now, now),
         )
-    return True, QUESTIONS["goal"]
-
-
-def get_onboarding_status(discord_user_id: str) -> tuple[bool, str]:
-    user, profile = _get_user_and_profile(discord_user_id)
-    if user is None:
-        return False, "Najprv sa zaregistruj cez: jonas register <meno>"
-    if profile is None:
-        return True, "Onboarding ešte nebol spustený. Použi: jonas onboarding start"
-
-    missing = _next_missing_field(profile)
-    if missing:
-        return True, f"Onboarding pokračuje.\n{QUESTIONS[missing]}"
-
-    return True, _format_summary(user["display_name"], profile)
-
-
-def reset_onboarding(discord_user_id: str) -> tuple[bool, str]:
-    user = _get_user(discord_user_id)
-    if user is None:
-        return False, "Najprv sa zaregistruj cez: jonas register <meno>"
-    with get_connection() as connection:
-        connection.execute("DELETE FROM user_profiles WHERE user_id = ?", (user["id"],))
-    return True, "Onboarding profil bol vymazaný. Začni cez: jonas onboarding start"
-
-
-def has_active_onboarding(discord_user_id: str) -> bool:
-    _, profile = _get_user_and_profile(discord_user_id)
-    return profile is not None and _next_missing_field(profile) is not None
+    return True, WELCOME_MESSAGE
 
 
 def process_onboarding_answer(
     discord_user_id: str, answer: str
 ) -> tuple[bool, str]:
-    user, profile = _get_user_and_profile(discord_user_id)
-    if user is None or profile is None:
+    """Z jednej vety vytvorí návrh týždenných commitments."""
+    session = _get_session(discord_user_id)
+    if session is None or not session["is_active"]:
         return False, "Onboarding nie je spustený. Použi: jonas onboarding start"
 
-    field = _next_missing_field(profile)
-    if field is None:
-        return True, _format_summary(user["display_name"], profile)
-
     clean_answer = answer.strip()
-    if not clean_answer:
-        return False, QUESTIONS[field]
-
+    proposal = parse_commitments(clean_answer)
+    now = datetime.now(timezone.utc).isoformat()
     with get_connection() as connection:
         connection.execute(
-            f"UPDATE user_profiles SET {field} = ?, updated_at = ? WHERE user_id = ?",
-            (clean_answer, datetime.now(timezone.utc).isoformat(), user["id"]),
+            """
+            UPDATE onboarding_sessions
+            SET last_answer = ?, proposed_commitments = ?, updated_at = ?
+            WHERE discord_user_id = ?
+            """,
+            (
+                clean_answer,
+                json.dumps(proposal, ensure_ascii=False) if proposal else None,
+                now,
+                discord_user_id,
+            ),
         )
 
-    _, updated_profile = _get_user_and_profile(discord_user_id)
-    next_field = _next_missing_field(updated_profile)
-    if next_field:
-        return True, QUESTIONS[next_field]
-    return True, _format_summary(user["display_name"], updated_profile)
+    if not proposal:
+        return False, UNCLEAR_MESSAGE
+    return True, _format_proposal(proposal)
 
 
 def confirm_onboarding(discord_user_id: str) -> tuple[bool, str]:
-    user, profile = _get_user_and_profile(discord_user_id)
-    if user is None or profile is None:
-        return False, "Onboarding nie je pripravený na potvrdenie."
-    if _next_missing_field(profile):
-        return False, "Onboarding ešte nie je dokončený. Použi: jonas onboarding status"
+    """Po potvrdení vytvorí navrhnuté commitments priamo."""
+    session = _get_session(discord_user_id)
+    if session is None or not session["is_active"]:
+        return False, "Onboarding nie je aktívny. Použi: jonas onboarding start"
 
-    proposal = _build_commitment_proposal(profile)
+    proposal = _load_proposal(session["proposed_commitments"])
     if not proposal:
-        return False, "Neviem vytvoriť návrh commitments. Uprav onboarding aktivity."
+        return False, UNCLEAR_MESSAGE
 
     messages = []
     for workout_type, count in proposal.items():
@@ -129,66 +114,130 @@ def confirm_onboarding(discord_user_id: str) -> tuple[bool, str]:
             return False, message
         messages.append(f"{workout_type} {count}x")
 
-    return True, "Commitments potvrdené: " + ", ".join(messages)
+    with get_connection() as connection:
+        connection.execute(
+            """
+            UPDATE onboarding_sessions
+            SET is_active = 0, updated_at = ?
+            WHERE discord_user_id = ?
+            """,
+            (datetime.now(timezone.utc).isoformat(), discord_user_id),
+        )
+    return True, "Týždenný záväzok je potvrdený: " + ", ".join(messages) + "."
 
 
-def _format_summary(display_name: str, profile) -> str:
-    proposal = _build_commitment_proposal(profile)
+def get_onboarding_status(discord_user_id: str) -> tuple[bool, str]:
+    """Debug stav ukazuje iba aktivitu, poslednú odpoveď a návrh."""
+    if _get_user(discord_user_id) is None:
+        return False, "Najprv sa zaregistruj cez: jonas register <meno>"
+
+    session = _get_session(discord_user_id)
+    if session is None:
+        return True, "Onboarding aktívny: nie\nPosledná odpoveď: žiadna\nNávrh: žiadny"
+
+    proposal = _load_proposal(session["proposed_commitments"])
     proposal_text = ", ".join(f"{key} {value}x" for key, value in proposal.items())
     return (
-        f"Onboarding dokončený pre {display_name}.\n"
-        f"Cieľ: {profile['goal']}\n"
-        f"Úroveň: {profile['level']}\n"
-        f"Aktivity: {profile['preferred_activities']}\n"
-        f"Obmedzenia: {profile['limitations']}\n"
-        f"Kapacita: {profile['weekly_capacity']}\n"
-        f"Návrh commitments: {proposal_text or 'bez návrhu'}\n"
-        "Ak súhlasíš, použi: jonas onboarding confirm"
+        True,
+        f"Onboarding aktívny: {'áno' if session['is_active'] else 'nie'}\n"
+        f"Posledná odpoveď: {session['last_answer'] or 'žiadna'}\n"
+        f"Návrh: {proposal_text or 'žiadny'}",
     )
 
 
-def _build_commitment_proposal(profile) -> dict[str, int]:
-    activity_text = (profile["preferred_activities"] or "").casefold()
-    activities = [
-        workout_type
-        for workout_type, aliases in ACTIVITY_ALIASES.items()
-        if any(alias in activity_text for alias in aliases)
-    ]
-    capacity_match = re.search(r"\d+", profile["weekly_capacity"] or "")
-    capacity = int(capacity_match.group()) if capacity_match else 0
-    if not activities or capacity <= 0:
+def reset_onboarding(discord_user_id: str) -> tuple[bool, str]:
+    if _get_user(discord_user_id) is None:
+        return False, "Najprv sa zaregistruj cez: jonas register <meno>"
+    with get_connection() as connection:
+        connection.execute(
+            "DELETE FROM onboarding_sessions WHERE discord_user_id = ?",
+            (discord_user_id,),
+        )
+    return True, "Onboarding bol resetovaný. Začni cez: jonas onboarding start"
+
+
+def has_active_onboarding(discord_user_id: str) -> bool:
+    session = _get_session(discord_user_id)
+    return session is not None and bool(session["is_active"])
+
+
+def parse_commitments(answer: str) -> dict[str, int]:
+    """Jednoduchý parser podporujúci bežné slovenské tvary a poradie počtu."""
+    normalized = _normalize(answer).replace("×", "x")
+    number_matches = list(re.finditer(r"\b(\d+)\s*x?\b", normalized))
+    if not number_matches:
         return {}
 
-    selected = activities[:capacity]
-    proposal = {activity: 1 for activity in selected}
-    remaining = capacity - len(selected)
-    index = 0
-    while remaining > 0:
-        activity = selected[index % len(selected)]
-        proposal[activity] += 1
-        remaining -= 1
-        index += 1
+    proposal = {}
+    used_numbers: set[int] = set()
+    for workout_type, aliases in ACTIVITY_ALIASES.items():
+        alias_matches = [
+            match
+            for alias in aliases
+            for match in re.finditer(rf"\b{re.escape(alias)}\b", normalized)
+        ]
+        if not alias_matches:
+            continue
+
+        activity_match = min(alias_matches, key=lambda match: match.start())
+        candidates = []
+        for index, number_match in enumerate(number_matches):
+            if index in used_numbers:
+                continue
+            distance = min(
+                abs(activity_match.start() - number_match.end()),
+                abs(number_match.start() - activity_match.end()),
+            )
+            if distance <= 25:
+                candidates.append((distance, index, number_match))
+        if not candidates:
+            continue
+
+        _, number_index, number_match = min(candidates, key=lambda item: item[0])
+        count = int(number_match.group(1))
+        if count > 0:
+            proposal[workout_type] = count
+            used_numbers.add(number_index)
     return proposal
 
 
-def _next_missing_field(profile) -> str | None:
-    return next((field for field in FIELDS if not profile[field]), None)
+def _format_proposal(proposal: dict[str, int]) -> str:
+    lines = ["Navrhujem týždenný záväzok:", ""]
+    lines.extend(f"- {workout_type} {count}x" for workout_type, count in proposal.items())
+    lines.extend(
+        [
+            "",
+            "Ak súhlasíš, napíš: jonas onboarding confirm",
+            "",
+            "V nedeľu o 19:00 ti potom napíšem a vyberieš presné dni a časy "
+            "tréningov na ďalší týždeň.",
+        ]
+    )
+    return "\n".join(lines)
+
+
+def _normalize(text: str) -> str:
+    decomposed = unicodedata.normalize("NFKD", text.casefold())
+    return "".join(char for char in decomposed if not unicodedata.combining(char))
+
+
+def _load_proposal(raw_proposal: str | None) -> dict[str, int]:
+    if not raw_proposal:
+        return {}
+    return {key: int(value) for key, value in json.loads(raw_proposal).items()}
 
 
 def _get_user(discord_user_id: str):
     with get_connection() as connection:
         return connection.execute(
-            "SELECT id, display_name FROM users WHERE discord_user_id = ? AND is_active = 1",
+            "SELECT id FROM users WHERE discord_user_id = ? AND is_active = 1",
             (discord_user_id,),
         ).fetchone()
 
 
-def _get_user_and_profile(discord_user_id: str):
-    user = _get_user(discord_user_id)
-    if user is None:
-        return None, None
+def _get_session(discord_user_id: str):
     with get_connection() as connection:
-        profile = connection.execute(
-            "SELECT * FROM user_profiles WHERE user_id = ?", (user["id"],)
+        return connection.execute(
+            "SELECT * FROM onboarding_sessions WHERE discord_user_id = ?",
+            (discord_user_id,),
         ).fetchone()
-    return user, profile

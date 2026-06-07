@@ -4,6 +4,7 @@ from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 from app.config import BOT_TIMEZONE, DISCORD_CHANNEL_ID
 from app.database import get_connection
+from app.services.coach_responder import generate_final_reply
 from app.services.planning_service import DAY_ORDER
 
 
@@ -45,10 +46,10 @@ async def scheduler_loop(client) -> None:
                 await send_daily_morning_message(client, now)
             if now.hour == 20 and now.minute == 0:
                 await send_evening_preparation_message(client, now)
-            await send_workout_start_reminders(client, now)
-            if now.minute % 10 == 0:
+            await send_workout_upcoming_reminders(client, now)
+            if 6 <= now.hour < 22 and now.minute == 0:
                 await send_post_workout_checks(client, now)
-            if now.hour == 7 and now.minute == 0:
+            if now.hour == 5 and now.minute == 59:
                 await send_unanswered_reminders(client, now)
         except Exception as error:
             print(f"Scheduler chyba: {error}")
@@ -80,22 +81,23 @@ async def send_evening_preparation_message(client, now: datetime) -> None:
         await _send_once(client, key, message)
 
 
-async def send_workout_start_reminders(client, now: datetime) -> None:
-    """V presnej minúte začiatku pripomenie používateľovi naplánovaný tréning."""
+async def send_workout_upcoming_reminders(client, now: datetime) -> None:
+    """Presne 15 minút pred začiatkom pripomenie naplánovaný tréning."""
     channel = await get_channel(client)
     if channel is None:
         return
 
-    for plan in _get_plans_starting_now(now):
-        key = f"workout_start_plan_{plan['id']}"
+    for plan in _get_plans_starting_in_15_minutes(now):
+        key = f"workout_upcoming_plan_{plan['id']}"
         if was_notification_sent(key):
             continue
 
-        await channel.send(
+        factual_message = (
             f"{plan['display_name']}, {_planned_workout_form(plan['display_name'])} "
-            f"{plan['workout_type']} na teraz. Už máš cvičiť. "
-            "Plán nebol návrh, bol to záväzok."
+            f"{plan['workout_type']} o {plan['planned_time']}. "
+            "Začínaš o 15 minút, priprav sa."
         )
+        await channel.send(await _scheduled_reply(factual_message, "strict"))
         mark_notification_sent(key)
 
 
@@ -109,11 +111,12 @@ async def send_post_workout_checks(client, now: datetime) -> None:
         if was_notification_sent(key):
             continue
 
-        await channel.send(
+        factual_message = (
             f"{plan['display_name']}, {_had_workout_form(plan['display_name'])} tréning. "
             f"Splnené? Zapíš výsledok napríklad: jonas done {plan['plan_ref']} <výsledok>, "
             f"alebo ak to nevyšlo: jonas missed {plan['plan_ref']}"
         )
+        await channel.send(await _scheduled_reply(factual_message, "coach"))
         with get_connection() as connection:
             connection.execute(
                 """
@@ -137,11 +140,12 @@ async def send_unanswered_reminders(client, now: datetime) -> None:
         if was_notification_sent(key):
             continue
 
-        await channel.send(
+        factual_message = (
             f"{plan['display_name']}, včera zostal tréning nezodpovedaný. "
             "Buď zapíš výsledok, alebo ho označ ako vynechaný. "
             "Ticho nie je stratégia."
         )
+        await channel.send(await _scheduled_reply(factual_message, "strict"))
         mark_notification_sent(key)
 
 
@@ -349,6 +353,7 @@ def _build_evening_message(target_date: date) -> str | None:
 
 
 def _get_plans_due_for_check(now: datetime) -> list[dict]:
+    """Pri hodinovej kontrole vráti tréningy začaté pred 60 až 119 minútami."""
     due_plans = []
     for plan in get_plans_for_date(now.date()):
         if plan["status"] not in {"planned", "postponed"}:
@@ -361,19 +366,20 @@ def _get_plans_due_for_check(now: datetime) -> list[dict]:
             tzinfo=now.tzinfo,
         )
         elapsed_minutes = (now - planned_at).total_seconds() / 60
-        if 60 <= elapsed_minutes <= 70:
+        if 60 <= elapsed_minutes < 120:
             due_plans.append(plan)
     return due_plans
 
 
-def _get_plans_starting_now(now: datetime) -> list[dict]:
-    """Vráti planned/postponed tréningy začínajúce v aktuálnej minúte."""
-    current_time = now.strftime("%H:%M")
+def _get_plans_starting_in_15_minutes(now: datetime) -> list[dict]:
+    """Vráti planned/postponed tréningy začínajúce presne o 15 minút."""
+    target = now + timedelta(minutes=15)
+    target_time = target.strftime("%H:%M")
     return [
         plan
-        for plan in get_plans_for_date(now.date())
+        for plan in get_plans_for_date(target.date())
         if plan["status"] in {"planned", "postponed"}
-        and plan["planned_time"] == current_time
+        and plan["planned_time"] == target_time
     ]
 
 
@@ -408,6 +414,18 @@ async def _send_once(client, key: str, message: str) -> None:
         return
     await channel.send(message)
     mark_notification_sent(key)
+
+
+async def _scheduled_reply(factual_message: str, tone: str) -> str:
+    """Vytvorí variabilnú trénerovskú pripomienku s bezpečným fallbackom."""
+    return await asyncio.to_thread(
+        generate_final_reply,
+        "Automatická pripomienka",
+        factual_message,
+        "scheduled_reminder",
+        tone,
+        None,
+    )
 
 
 def _personal_motivation(display_name: str) -> str:

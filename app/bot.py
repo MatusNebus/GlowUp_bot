@@ -4,6 +4,7 @@ import re
 
 import discord
 
+from app.ai_agent import decide_agent_action
 from app.ai_parser import (
     AI_NOT_CONFIGURED_MESSAGE,
     OpenAIKeyMissingError,
@@ -11,6 +12,7 @@ from app.ai_parser import (
 from app.ai_router import route_natural_message
 from app.config import ADMIN_DISCORD_USER_ID, DISCORD_CHANNEL_ID, DISCORD_TOKEN
 from app.services.coach_responder import (
+    generate_final_reply,
     generate_coach_reply,
     respond_error,
     respond_forbidden_walk,
@@ -41,11 +43,13 @@ from app.services.onboarding_service import (
 )
 from app.services.pending_actions_service import (
     build_pending_context,
+    clear_old_pending_actions,
     create_pending_action,
     format_pending_action,
     get_latest_pending_action,
     resolve_pending_action,
 )
+from app.tool_executor import execute_tool
 from app.services.planning_service import (
     PLAN_FORMAT_MESSAGE,
     add_plan,
@@ -55,6 +59,13 @@ from app.services.planning_service import (
     weekly_status,
 )
 from app.services.scheduler_service import send_scheduler_test_messages, start_scheduler
+from app.services.replacement_service import (
+    approve_replacement,
+    get_replacement_detail,
+    list_replacements,
+    reject_replacement,
+    request_workout_replacement,
+)
 from app.services.stats_service import (
     MONTH_FORMAT_MESSAGE,
     get_all_month_stats,
@@ -228,6 +239,17 @@ def _parse_joker_command(command_text: str) -> tuple[int, str, str] | None:
     return int(plan_id_text), new_day, new_time
 
 
+def _parse_replacement_request(command_text: str) -> tuple[int, str, str, str, str] | None:
+    prefix = "replacement request "
+    if not command_text.casefold().startswith(prefix):
+        return None
+    parts = command_text[len(prefix) :].split(maxsplit=4)
+    if len(parts) != 5 or not parts[0].isdigit():
+        return None
+    plan_ref, workout_type, day, time, reason = parts
+    return int(plan_ref), workout_type, day, time, reason
+
+
 def _parse_stats_command(command_text: str) -> tuple[bool, str | None] | None:
     parts = command_text.split()
     if not parts or parts[0].casefold() not in {"stats", "report"}:
@@ -336,6 +358,50 @@ async def _route_with_ai(
     except Exception as error:
         print(f"OpenAI router chyba: {error}")
         raise
+
+
+async def _decide_with_agent(
+    message_text: str,
+    author_display_name: str,
+    context_text: str,
+    pending_action_text: str,
+) -> dict | None:
+    try:
+        return await asyncio.to_thread(
+            decide_agent_action,
+            message_text,
+            author_display_name,
+            context_text,
+            pending_action_text,
+        )
+    except OpenAIKeyMissingError:
+        return None
+    except Exception as error:
+        print(f"OpenAI agent chyba: {error}")
+        raise
+
+
+async def _send_agent_result(
+    message: discord.Message,
+    original_message: str,
+    factual_result: str,
+    result_type: str,
+    tone: str,
+    ai_context: str,
+) -> None:
+    if result_type in {"system_info", "user_error", "clarify"}:
+        await message.channel.send(factual_result)
+        return
+
+    reply = await asyncio.to_thread(
+        generate_final_reply,
+        original_message,
+        factual_result,
+        result_type,
+        tone,
+        ai_context[:1800],
+    )
+    await message.channel.send(reply)
 
 
 def _router_to_parsed(router_result: dict) -> dict:
@@ -656,6 +722,9 @@ async def on_message(message: discord.Message) -> None:
                 channel_id,
                 message.content,
             )
+        if active_onboarding and should_store_message:
+            _, response = process_onboarding_answer(discord_user_id, message.content)
+            await message.channel.send(response)
         return
     is_onboarding_follow_up = active_onboarding and not command_text.casefold().startswith(
         "onboarding "
@@ -684,6 +753,8 @@ async def on_message(message: discord.Message) -> None:
             "jonas register Ema, jonas users, jonas commitment beh 2, "
             "jonas commitments, jonas commitments all, jonas changes, "
             "jonas approve change 1, jonas reject change 1, "
+            "jonas replacement request 1 posilka utorok 18:00 hala je zatvorená, "
+            "jonas approve replacement 1, jonas reject replacement 1, jonas replacements, "
             "jonas plan beh piatok 18:00, jonas my week, jonas week, "
             "jonas planning status, jonas done 3 5.2 32, "
             "jonas done 4 drepy 3x12; kliky 3x8, jonas short 3 3.0 20, "
@@ -692,7 +763,7 @@ async def on_message(message: discord.Message) -> None:
             "jonas stats all, jonas report all, jonas test scheduler. "
             "Onboarding: jonas onboarding start, jonas onboarding status, "
             "jonas onboarding confirm. Debug: jonas pending, "
-            "jonas coach test success. "
+            "jonas agent test <text>, jonas tool test <tool> <json>. "
             "Automatické správy: nedeľa 19:00 plánovanie, denne 06:00 ranný plán, "
             "denne 20:00 príprava na zajtra, po tréningu kontrola. "
             "Prirodzený jazyk: jonas v piatok o 18:00 beh; "
@@ -739,7 +810,7 @@ async def on_message(message: discord.Message) -> None:
         await message.channel.send(response if success else respond_error(response))
         return
 
-    if normalized_command == "onboarding status":
+    if normalized_command in {"onboarding status", "onboarding debug"}:
         success, response = get_onboarding_status(discord_user_id)
         await message.channel.send(response if success else respond_error(response))
         return
@@ -790,6 +861,46 @@ async def on_message(message: discord.Message) -> None:
 
     if normalized_command == "changes":
         await message.channel.send(list_changes())
+        return
+
+    if normalized_command == "replacements":
+        await message.channel.send(list_replacements())
+        return
+
+    if normalized_command.startswith("replacement request "):
+        parsed_replacement = _parse_replacement_request(command_text)
+        if parsed_replacement is None:
+            await message.channel.send(
+                "Použi: jonas replacement request <číslo> <typ> <deň> <čas> <dôvod>"
+            )
+            return
+        plan_ref, workout_type, day, time, reason = parsed_replacement
+        success, response = request_workout_replacement(
+            discord_user_id, plan_ref, None, workout_type, day, time, reason
+        )
+        await message.channel.send(response)
+        return
+
+    if normalized_command.startswith("approve replacement ") or normalized_command.startswith(
+        "reject replacement "
+    ):
+        parts = normalized_command.split()
+        if len(parts) != 3 or not parts[2].isdigit():
+            await message.channel.send(
+                "Použi: jonas approve replacement <id> alebo jonas reject replacement <id>"
+            )
+            return
+        function = approve_replacement if parts[0] == "approve" else reject_replacement
+        _, response = function(discord_user_id, int(parts[2]))
+        await message.channel.send(response)
+        return
+
+    if normalized_command.startswith("replacement "):
+        parts = normalized_command.split()
+        if len(parts) == 2 and parts[1].isdigit():
+            await message.channel.send(get_replacement_detail(int(parts[1])))
+        else:
+            await message.channel.send("Použi: jonas replacement <id>")
         return
 
     if normalized_command.startswith("approve change ") or normalized_command.startswith(
@@ -891,6 +1002,44 @@ async def on_message(message: discord.Message) -> None:
 
     if normalized_command == "pending":
         await message.channel.send(format_pending_action(pending_action))
+        return
+
+    if normalized_command == "agent test" or normalized_command.startswith("agent test "):
+        test_text = command_text[len("agent test") :].strip()
+        if not test_text:
+            await message.channel.send("Použi: jonas agent test <text>")
+            return
+        author_name = getattr(message.author, "display_name", str(message.author))
+        try:
+            decision = await _decide_with_agent(
+                test_text, author_name, ai_context, pending_context
+            )
+        except Exception:
+            await message.channel.send("AI agent teraz neodpovedal.")
+            return
+        if decision is None:
+            await message.channel.send(AI_NOT_CONFIGURED_MESSAGE)
+            return
+        payload = json.dumps(decision, ensure_ascii=False, indent=2)
+        await message.channel.send(f"```json\n{payload[:1850]}\n```")
+        return
+
+    if normalized_command == "tool test" or normalized_command.startswith("tool test "):
+        is_admin, error = _is_admin(discord_user_id)
+        if not is_admin:
+            await message.channel.send(error)
+            return
+        payload = command_text[len("tool test") :].strip()
+        tool_name, _, args_text = payload.partition(" ")
+        try:
+            tool_args = json.loads(args_text or "{}")
+        except json.JSONDecodeError:
+            await message.channel.send('Použi: jonas tool test <tool> {"argument": "hodnota"}')
+            return
+        success, result, result_type = execute_tool(tool_name, tool_args, discord_user_id)
+        await message.channel.send(
+            f"success={success}\nresult_type={result_type}\n{result}"
+        )
         return
 
     if normalized_command == "ai test" or normalized_command.startswith("ai test "):
@@ -1010,88 +1159,69 @@ async def on_message(message: discord.Message) -> None:
 
     author_name = getattr(message.author, "display_name", str(message.author))
     try:
-        router_result = await _route_with_ai(
+        agent_decision = await _decide_with_agent(
             command_text, author_name, ai_context, pending_context
         )
     except Exception:
         await message.channel.send(
-            "OpenAI parser teraz neodpovedal. Tvrdé príkazy stále fungujú cez: "
-            "jonas help"
+            "AI agent teraz neodpovedal. Tvrdé príkazy stále fungujú cez: jonas help"
         )
         return
 
-    if router_result is None:
+    if agent_decision is None:
         await message.channel.send(AI_NOT_CONFIGURED_MESSAGE)
         return
 
-    route = router_result["route"]
-    if route in {"general_advice", "casual_chat", "app_help", "context_question"}:
-        factual_result = (
-            APP_HELP_TEXT if route == "app_help" else router_result["response_hint"]
-        )
-        await _natural_coach_response(message, route, factual_result)
-        return
-
-    if router_result["needs_clarification"] and route != "tool_action":
+    if agent_decision["mode"] == "clarify":
         await message.channel.send(
-            router_result["clarification_question"]
-            or "Potrebujem trochu presnejšie povedať, čo chceš."
+            agent_decision["clarification_question"]
+            or "Čo presne chceš spraviť?"
         )
         return
 
-    parsed = _router_to_parsed(router_result)
-
-    if route == "commitment_change_request":
-        request_id = router_result["tool_args"]["request_id"]
-        vote = router_result["tool_args"]["vote"]
-        if request_id is not None and vote in {"approve", "reject"}:
-            success, response = vote_change(discord_user_id, request_id, vote)
-            await _natural_coach_response(message, "planning", response, success)
+    if agent_decision["mode"] == "reply":
+        if agent_decision["reply_intent"] == "cancel_pending":
+            clear_old_pending_actions(discord_user_id)
+            await message.channel.send("Dobre, presun som zrušil. Nič som nezmenil.")
             return
-        if not parsed["workout_type"] or parsed["count_per_week"] is None:
-            await message.channel.send(
-                router_result["clarification_question"]
-                or "Ktorý záväzok chceš zmeniť a na koľko tréningov týždenne?"
-            )
-            return
-        success, response = _request_or_set_commitment(
-            discord_user_id, parsed["workout_type"], parsed["count_per_week"]
+        factual_result = (
+            agent_decision["args"].get("answer")
+            or agent_decision["args"].get("question")
+            or agent_decision["reason_summary"]
         )
-        await _natural_coach_response(message, "planning", response, success)
-        return
-
-    if route == "unknown":
-        await _natural_coach_response(
+        result_type = (
+            "casual"
+            if agent_decision["tone"] == "casual"
+            else "general_advice"
+        )
+        await _send_agent_result(
             message,
-            "casual_chat",
-            router_result["response_hint"]
-            or "Neviem presne, čo odo mňa potrebuješ. Skús to povedať konkrétnejšie.",
-        )
-        return
-
-    if (
-        is_pending_follow_up
-        and pending_action is not None
-        and parsed["intent"] != pending_action["intent"]
-    ):
-        return
-
-    missing_fields = _get_missing_fields(parsed)
-    if missing_fields:
-        create_pending_action(
-            discord_user_id,
-            parsed["intent"],
             command_text,
-            missing_fields,
-            parsed,
+            factual_result,
+            result_type,
+            agent_decision["tone"],
+            ai_context,
         )
-        await message.channel.send(_pending_question(parsed["intent"], missing_fields))
         return
 
-    should_resolve_pending = _should_resolve_pending(pending_action, parsed)
-    success = await _execute_ai_intent(message, parsed)
-    if success and should_resolve_pending:
-        resolve_pending_action(pending_action["id"])
+    tool_name = agent_decision["tool"]
+    if not tool_name:
+        await message.channel.send("Neviem bezpečne určiť ďalší krok. Skús to spresniť.")
+        return
+
+    success, factual_result, result_type = await asyncio.to_thread(
+        execute_tool, tool_name, agent_decision["args"], discord_user_id
+    )
+    if not success and result_type != "user_error":
+        result_type = "user_error"
+    await _send_agent_result(
+        message,
+        command_text,
+        factual_result,
+        result_type,
+        agent_decision["tone"],
+        ai_context,
+    )
 
 
 def run_bot() -> None:
