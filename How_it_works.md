@@ -1,3 +1,102 @@
+HOSTING DISCORD BOTA JONÁŠ NA HETZNER VPS
+
+1. Pripojenie na server z Windows PowerShellu:
+ssh -i $env:USERPROFILE\.ssh\id_ed25519_jonas root@IP_ADRESA_SERVERA
+
+2. Aktualizácia servera:
+apt update && apt upgrade -y
+apt install -y python3 python3-venv python3-pip git nano
+
+3. Klonovanie projektu z GitHubu:
+cd /opt
+git clone https://github.com/MatusNebus/GlowUp_bot.git jonas
+cd /opt/jonas
+
+4. Prepnutie na správnu branch:
+git fetch origin
+git switch version_2
+git reset --hard origin/version_2
+git clean -fd
+
+5. Vytvorenie Python prostredia:
+python3 -m venv .venv
+source .venv/bin/activate
+python -m pip install --upgrade pip
+
+6. Inštalácia requirements:
+Ak audioop-lts robí problém, vytvor server requirements bez neho:
+grep -v "audioop-lts" requirements.txt > requirements_server.txt
+pip install -r requirements_server.txt
+
+Ak je requirements.txt divne uložený ako binary/UTF-16, treba ho najprv previesť na UTF-8 alebo upraviť v GitHube:
+audioop-lts==0.2.2; python_version >= "3.13"
+
+7. Skopírovanie .env súboru z PC na server:
+scp -i $env:USERPROFILE\.ssh\id_ed25519_jonas C:\_matus\GlowUp_bot\.env root@IP_ADRESA_SERVERA:/opt/jonas/.env
+
+8. Ochrana .env súboru:
+cd /opt/jonas
+chmod 600 .env
+
+9. Test ručného spustenia:
+source .venv/bin/activate
+python -m app.main
+
+Ak bot odpovedá na Discorde, zastaviť cez CTRL + C.
+
+10. Vytvorenie systemd služby:
+cat > /etc/systemd/system/jonas.service <<'EOF'
+[Unit]
+Description=Jonas Discord Bot
+After=network.target
+
+[Service]
+WorkingDirectory=/opt/jonas
+ExecStart=/opt/jonas/.venv/bin/python -m app.main
+Restart=always
+RestartSec=5
+Environment=PYTHONUNBUFFERED=1
+
+[Install]
+WantedBy=multi-user.target
+EOF
+
+11. Zapnutie služby:
+systemctl daemon-reload
+systemctl enable jonas
+systemctl start jonas
+
+12. Kontrola stavu:
+systemctl status jonas
+
+Ak je tam Active: active (running), bot beží správne.
+
+13. Logy:
+journalctl -u jonas -f
+
+14. Reštart bota:
+systemctl restart jonas
+
+15. Update po zmene kódu na GitHube:
+cd /opt/jonas
+git pull
+systemctl restart jonas
+
+16. Základný firewall:
+ufw allow OpenSSH
+ufw enable
+ufw status
+
+
+
+
+
+
+
+
+
+
+
 # Ako funguje Couple GlowUp Bot
 
 Tento dokument vysvetľuje aktuálny stav projektu podľa zdrojového kódu. Projektová
