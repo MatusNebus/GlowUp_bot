@@ -1,3 +1,4 @@
+import logging
 from datetime import date, datetime, timedelta, timezone
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
@@ -7,34 +8,50 @@ from app.services.planning_service import DAY_ORDER, get_current_week_start
 from app.services.activity_service import list_activities
 from app.services.rules_service import get_rules
 
+logger = logging.getLogger(__name__)
+
 
 def save_channel_message(
     discord_user_id: str,
     author_display_name: str,
     channel_id: str,
     message_text: str,
+    is_bot: bool = False,
 ) -> None:
-    """Uloží nebot správu z kanála, aby AI rozumela nadväzujúcej konverzácii."""
+    """Store a human or bot channel message for conversational continuity."""
     clean_text = message_text.strip()
     if not clean_text:
         return
 
     with get_connection() as connection:
+        timestamp = datetime.now(timezone.utc).isoformat()
         connection.execute(
             """
             INSERT INTO message_memory (
-                discord_user_id, author_display_name, channel_id, message_text, created_at
+                discord_user_id, author_display_name, is_bot, channel_id, message_text, created_at,
+                author_id, author_name, content, timestamp
             )
-            VALUES (?, ?, ?, ?, ?)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 discord_user_id,
                 author_display_name,
+                int(is_bot),
                 channel_id,
                 clean_text,
-                datetime.now(timezone.utc).isoformat(),
+                timestamp,
+                discord_user_id,
+                author_display_name,
+                clean_text,
+                timestamp,
             ),
         )
+    logger.debug(
+        "Memory saved channel=%s author=%s is_bot=%s",
+        channel_id,
+        discord_user_id,
+        is_bot,
+    )
 
 
 def save_user_message(discord_user_id: str, message_text: str) -> None:
@@ -67,7 +84,8 @@ def build_ai_context(
         if channel_id:
             memories = connection.execute(
                 """
-                SELECT discord_user_id, author_display_name, message_text, created_at
+                SELECT author_id AS discord_user_id, author_name AS author_display_name,
+                       is_bot, content AS message_text, timestamp AS created_at
                 FROM message_memory
                 WHERE channel_id = ?
                 ORDER BY id DESC
@@ -78,7 +96,8 @@ def build_ai_context(
         else:
             memories = connection.execute(
                 """
-                SELECT discord_user_id, author_display_name, message_text, created_at
+                SELECT author_id AS discord_user_id, author_name AS author_display_name,
+                       is_bot, content AS message_text, timestamp AS created_at
                 FROM message_memory
                 ORDER BY id DESC
                 LIMIT ?
@@ -199,6 +218,15 @@ def build_ai_context(
         list_activities(),
         activity_changes,
     )
+    logger.debug(
+        "Context built user=%s recent_messages=%s pending_external=unknown commitments=%s plans=%s open_changes=%s open_replacements=%s",
+        discord_user_id,
+        len(memories),
+        len(commitments),
+        len(plans) + len(next_week_plans),
+        len(open_changes),
+        len(open_replacements),
+    )
     next_lines = ["", f"Plán budúceho týždňa od {next_week_start}:"]
     next_lines.extend(
         f"- {plan['workout_type']}; {plan['planned_day']} {plan['planned_time']}; status={plan['status']}"
@@ -291,12 +319,15 @@ def _format_context(
     else:
         lines.append("- žiadne")
 
-    lines.extend(["", "Posledné správy v kanáli, najnovšia prvá:"])
+    lines.extend(["", "RECENT CHANNEL MESSAGES:"])
     if memories:
-        for memory in memories:
+        for memory in reversed(memories):
             author = memory["author_display_name"] or memory["discord_user_id"]
-            own = " (aktuálny používateľ)" if memory["discord_user_id"] == discord_user_id else ""
-            lines.append(f"- {author}{own}: {memory['message_text']}")
+            try:
+                shown_time = datetime.fromisoformat(memory["created_at"]).strftime("%H:%M")
+            except ValueError:
+                shown_time = "??:??"
+            lines.append(f"[{shown_time}] {author}: {memory['message_text']}")
     else:
         lines.append("- bez uloženej histórie")
     lines.extend(["", "Aktívny katalóg aktivít:"])
@@ -321,4 +352,57 @@ def _format_context(
             )
     else:
         lines.append("- žiadne")
+    return "\n".join(lines)
+
+
+def build_debug_context(discord_user_id: str, channel_id: str) -> str:
+    """Return an admin-facing concise context summary without internal parsed JSON."""
+    with get_connection() as connection:
+        user = connection.execute(
+            "SELECT display_name FROM users WHERE discord_user_id = ?",
+            (discord_user_id,),
+        ).fetchone()
+        commitments = connection.execute(
+            """
+            SELECT commitments.workout_type, commitments.count_per_week
+            FROM commitments JOIN users ON users.id = commitments.user_id
+            WHERE users.discord_user_id = ? AND commitments.is_active = 1
+            ORDER BY commitments.workout_type
+            """,
+            (discord_user_id,),
+        ).fetchall()
+        pending = connection.execute(
+            """
+            SELECT original_message FROM pending_actions
+            WHERE discord_user_id = ? AND is_resolved = 0 ORDER BY id DESC LIMIT 1
+            """,
+            (discord_user_id,),
+        ).fetchone()
+        messages = connection.execute(
+            """
+            SELECT author_name AS author_display_name, content AS message_text,
+                   timestamp AS created_at
+            FROM message_memory WHERE channel_id = ? ORDER BY id DESC LIMIT 5
+            """,
+            (channel_id,),
+        ).fetchall()
+        change_count = connection.execute(
+            "SELECT COUNT(*) AS count FROM commitment_change_requests WHERE status = 'open'"
+        ).fetchone()["count"]
+        replacement_count = connection.execute(
+            "SELECT COUNT(*) AS count FROM workout_replacement_requests WHERE status = 'open'"
+        ).fetchone()["count"]
+    lines = [
+        f"User: {user['display_name'] if user else discord_user_id}",
+        "Commitments: "
+        + (
+            ", ".join(f"{row['workout_type']} {row['count_per_week']}x" for row in commitments)
+            or "žiadne"
+        ),
+        f"Rozpracovaná požiadavka: {pending['original_message'] if pending else 'žiadna'}",
+        f"Otvorené návrhy: commitments={change_count}, náhrady={replacement_count}",
+        "Posledných 5 správ:",
+    ]
+    for row in reversed(messages):
+        lines.append(f"- {row['author_display_name']}: {row['message_text']}")
     return "\n".join(lines)

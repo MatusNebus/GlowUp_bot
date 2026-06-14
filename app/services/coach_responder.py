@@ -1,8 +1,11 @@
+import logging
+
 from openai import OpenAI
 
 from app.config import OPENAI_API_KEY, OPENAI_MODEL
 from app.services.rules_service import get_rules
 
+logger = logging.getLogger(__name__)
 
 FINAL_REPLY_INSTRUCTIONS = """
 Si Jonáš, prirodzený slovenský AI tréner v Discord chate.
@@ -51,8 +54,8 @@ def generate_final_reply(
             max_output_tokens=300,
         )
         return response.output_text.strip() or fallback
-    except Exception as error:
-        print(f"OpenAI final responder chyba: {error}")
+    except Exception:
+        logger.exception("Coach responder failed; using factual fallback")
         return fallback
 
 

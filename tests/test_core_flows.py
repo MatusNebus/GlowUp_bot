@@ -1,3 +1,4 @@
+import asyncio
 import unittest
 from datetime import datetime, timezone
 from pathlib import Path
@@ -14,7 +15,9 @@ from app.services.planning_service import add_plan, get_week_start
 from app.services.joker_service import use_joker
 from app.services.users_service import ensure_user_exists
 from app.services.scheduler_service import _users_missing_commitments
+from app.services.context_service import build_ai_context, save_channel_message
 from app.tool_executor import execute_tool
+from app.bot import _natural_approval_result, send_and_remember
 
 
 TEST_DB = Path(__file__).resolve().parent.parent / "data" / "test_core_flows.db"
@@ -151,6 +154,53 @@ class CoreFlowTests(unittest.TestCase):
                 (now.isoformat(),),
             )
         self.assertNotIn("2", [user["discord_user_id"] for user in _users_missing_commitments(now)])
+
+    def test_context_contains_human_and_bot_messages_in_order(self):
+        save_channel_message("1", "Matúš", "channel-1", "prvá správa")
+        save_channel_message("jonas", "Jonáš", "channel-1", "moja otázka", is_bot=True)
+        save_channel_message("1", "Matúš", "channel-1", "kliky číslo, zhyby číslo")
+        context = build_ai_context("1", "channel-1", 5)
+        self.assertIn("RECENT CHANNEL MESSAGES:", context)
+        self.assertLess(context.index("prvá správa"), context.index("moja otázka"))
+        self.assertLess(context.index("moja otázka"), context.index("kliky číslo"))
+        with database.get_connection() as connection:
+            bot_row = connection.execute(
+                "SELECT is_bot FROM message_memory WHERE discord_user_id = 'jonas'"
+            ).fetchone()
+        self.assertEqual(bot_row["is_bot"], 1)
+
+    def test_natural_approval_uses_single_open_request(self):
+        set_commitment("1", "beh", 3)
+        self.assertTrue(request_commitment_change("1", "beh", 2)[0])
+        result = _natural_approval_result("2", "schvaľujem")
+        self.assertIsNotNone(result)
+        self.assertTrue(result[0])
+        self.assertEqual(list_commitments("1")[0]["count_per_week"], 2)
+
+    def test_send_and_remember_stores_bot_reply_and_hides_internal_details(self):
+        class FakeChannel:
+            id = "channel-send"
+
+            def __init__(self):
+                self.sent = []
+
+            async def send(self, content):
+                self.sent.append(content)
+                return content
+
+        channel = FakeChannel()
+        asyncio.run(send_and_remember(channel, "pending action week_planning plan_slots"))
+        self.assertNotIn("pending action", channel.sent[0])
+        with database.get_connection() as connection:
+            row = connection.execute(
+                """
+                SELECT author_id, author_name, is_bot, channel_id, content, timestamp
+                FROM message_memory WHERE channel_id = 'channel-send'
+                """
+            ).fetchone()
+        self.assertEqual(row["author_name"], "Jonáš")
+        self.assertEqual(row["is_bot"], 1)
+        self.assertTrue(row["timestamp"])
 
 
 if __name__ == "__main__":

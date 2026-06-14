@@ -1,11 +1,18 @@
 import json
+import logging
 from datetime import date
 
 from openai import OpenAI
 
-from app.ai_parser import AI_NOT_CONFIGURED_MESSAGE, OpenAIKeyMissingError
 from app.config import OPENAI_API_KEY, OPENAI_MODEL
 from app.services.rules_service import get_rules
+
+logger = logging.getLogger(__name__)
+AI_NOT_CONFIGURED_MESSAGE = "AI odpovede teraz nie sú dostupné. Skús to znova neskôr."
+
+
+class OpenAIKeyMissingError(RuntimeError):
+    pass
 
 
 TOOLS = [
@@ -234,6 +241,10 @@ Rozhodovacie pravidlá:
 - Žiadosť o plánovanie tohto alebo budúceho týždňa rieš cez start_week_planning a target_week.
 - Pri plan_workout nastav target_week podľa konverzácie; bez údaja použi current_week.
 - Ak je otvorená pending akcia week_planning, pri ďalších plan_workout použi jej target_week.
+- Ak je otvorená pending akcia create_activity, save_commitments, replacement_activity
+  alebo commitment_type_activity, aktuálna krátka správa opisuje polia aktivity.
+  Prelož napríklad "kliky číslo, zhyby číslo" na activity_fields a vyber
+  create_activity_with_fields. Nikdy takúto odpoveď nevyhodnoť ako náhradu tréningu.
 - Presun na rovnaký alebo skorší deň rieš move_workout.
 - Presun na neskorší deň tiež začni cez move_workout; Python vyžiada potvrdenie žolíka.
 - Ak kontext obsahuje pending confirm_joker_move a používateľ jasne potvrdí,
@@ -274,23 +285,35 @@ def decide_agent_action(
         raise OpenAIKeyMissingError(AI_NOT_CONFIGURED_MESSAGE)
 
     client = OpenAI(api_key=OPENAI_API_KEY)
-    response = client.responses.create(
-        model=OPENAI_MODEL,
-        instructions=AGENT_INSTRUCTIONS,
-        input=(
-            f"Dátum: {date.today().isoformat()}\n"
-            f"Autor: {author_display_name}\n"
-            f"Aktuálna správa: {message_text}\n\n"
-            f"{context_text}\n\n{pending_action_text}\n\nAKTUÁLNE PRAVIDLÁ:\n{get_rules()}"
-        ),
-        text={
-            "format": {
-                "type": "json_schema",
-                "name": "couple_glowup_agent_decision",
-                "schema": AGENT_SCHEMA,
-                "strict": True,
-            }
-        },
-        max_output_tokens=800,
-    )
-    return json.loads(response.output_text)
+    try:
+        response = client.responses.create(
+            model=OPENAI_MODEL,
+            instructions=AGENT_INSTRUCTIONS,
+            input=(
+                f"Dátum: {date.today().isoformat()}\n"
+                f"Autor: {author_display_name}\n"
+                f"Aktuálna správa: {message_text}\n\n"
+                f"{context_text}\n\n{pending_action_text}\n\nAKTUÁLNE PRAVIDLÁ:\n{get_rules()}"
+            ),
+            text={
+                "format": {
+                    "type": "json_schema",
+                    "name": "couple_glowup_agent_decision",
+                    "schema": AGENT_SCHEMA,
+                    "strict": True,
+                }
+            },
+            max_output_tokens=800,
+        )
+        decision = json.loads(response.output_text)
+        logger.debug(
+            "AI agent decision mode=%s tool=%s args=%s reply_intent=%s json_parse=success",
+            decision.get("mode"),
+            decision.get("tool"),
+            decision.get("args"),
+            decision.get("reply_intent"),
+        )
+        return decision
+    except Exception:
+        logger.exception("AI agent failed json_parse=error")
+        raise

@@ -1,4 +1,5 @@
 import asyncio
+import logging
 from datetime import date, datetime, timedelta, timezone
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
@@ -8,21 +9,23 @@ from app.services.activity_service import format_result_prompt
 from app.services.coach_responder import generate_final_reply
 from app.services.joker_service import use_joker
 from app.services.planning_service import DAY_ORDER
+from app.services.context_service import save_channel_message
 from app.services.workout_service import miss_workout
 
 
 _scheduler_task: asyncio.Task | None = None
+logger = logging.getLogger(__name__)
 
 
 def start_scheduler(client) -> asyncio.Task | None:
     global _scheduler_task
     if not DISCORD_CHANNEL_ID:
-        print("Scheduler sa nespustil: chýba DISCORD_CHANNEL_ID.")
+        logger.info("Scheduler sa nespustil: chýba DISCORD_CHANNEL_ID.")
         return None
     try:
         int(DISCORD_CHANNEL_ID)
     except ValueError:
-        print("Scheduler sa nespustil: DISCORD_CHANNEL_ID musí byť číslo.")
+        logger.error("Scheduler sa nespustil: DISCORD_CHANNEL_ID musí byť číslo.")
         return None
     if _scheduler_task is None or _scheduler_task.done():
         _scheduler_task = asyncio.create_task(scheduler_loop(client))
@@ -47,8 +50,8 @@ async def scheduler_loop(client) -> None:
                 await send_unanswered_reminders(client, now)
             if now.hour == 12 and now.minute == 0:
                 await resolve_unanswered_workouts(client, now)
-        except Exception as error:
-            print(f"Scheduler chyba: {error}")
+        except Exception:
+            logger.exception("Scheduler tick failed")
         await asyncio.sleep(60)
 
 
@@ -248,8 +251,8 @@ async def get_channel(client):
         return channel
     try:
         return await client.fetch_channel(channel_id)
-    except Exception as error:
-        print(f"Scheduler nevie načítať kanál {channel_id}: {error}")
+    except Exception:
+        logger.exception("Scheduler nevie načítať kanál %s", channel_id)
         return None
 
 
@@ -268,6 +271,14 @@ async def _send_facts_once(client, key: str, facts: str, tone: str) -> bool:
         None,
     )
     await channel.send(message)
+    bot_user = getattr(client, "user", None)
+    save_channel_message(
+        str(getattr(bot_user, "id", "jonas")),
+        getattr(bot_user, "display_name", "Jonáš"),
+        str(channel.id),
+        message,
+        is_bot=True,
+    )
     mark_notification_sent(key)
     return True
 

@@ -72,11 +72,6 @@ def request_workout_replacement(
             return False, f"Pre tento tréning už existuje otvorená náhrada #{existing['id']}."
 
         now = datetime.now(timezone.utc).isoformat()
-        replacement_week_start = plan["week_start"]
-        if plan["planned_day"] == "nedela" and request["replacement_day"] == "pondelok":
-            replacement_week_start = (
-                date.fromisoformat(plan["week_start"]) + timedelta(days=7)
-            ).isoformat()
         cursor = connection.execute(
             """
             INSERT INTO workout_replacement_requests (
@@ -310,6 +305,11 @@ def _apply_if_unanimous(request_id: int) -> tuple[bool, str]:
             return False, "Pôvodný tréning už nemožno nahradiť."
 
         now = datetime.now(timezone.utc).isoformat()
+        replacement_week_start = plan["week_start"]
+        if plan["planned_day"] == "nedela" and request["replacement_day"] == "pondelok":
+            replacement_week_start = (
+                date.fromisoformat(plan["week_start"]) + timedelta(days=7)
+            ).isoformat()
         connection.execute(
             "UPDATE workout_replacement_requests SET status = 'approved' WHERE id = ?",
             (request_id,),

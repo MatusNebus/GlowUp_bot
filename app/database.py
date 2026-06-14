@@ -65,9 +65,14 @@ def _create_preserved_tables(connection: sqlite3.Connection) -> None:
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             discord_user_id TEXT NOT NULL,
             author_display_name TEXT,
+            is_bot INTEGER NOT NULL DEFAULT 0,
             channel_id TEXT,
             message_text TEXT NOT NULL,
-            created_at TEXT NOT NULL
+            created_at TEXT NOT NULL,
+            author_id TEXT,
+            author_name TEXT,
+            content TEXT,
+            timestamp TEXT
         );
 
         CREATE TABLE IF NOT EXISTS user_profiles (
@@ -85,7 +90,21 @@ def _create_preserved_tables(connection: sqlite3.Connection) -> None:
         """
     )
     _ensure_column(connection, "message_memory", "author_display_name", "TEXT")
+    _ensure_column(connection, "message_memory", "is_bot", "INTEGER NOT NULL DEFAULT 0")
     _ensure_column(connection, "message_memory", "channel_id", "TEXT")
+    _ensure_column(connection, "message_memory", "author_id", "TEXT")
+    _ensure_column(connection, "message_memory", "author_name", "TEXT")
+    _ensure_column(connection, "message_memory", "content", "TEXT")
+    _ensure_column(connection, "message_memory", "timestamp", "TEXT")
+    connection.execute(
+        """
+        UPDATE message_memory
+        SET author_id = COALESCE(author_id, discord_user_id),
+            author_name = COALESCE(author_name, author_display_name, discord_user_id),
+            content = COALESCE(content, message_text),
+            timestamp = COALESCE(timestamp, created_at)
+        """
+    )
 
 
 def _create_dynamic_tables(connection: sqlite3.Connection) -> None:

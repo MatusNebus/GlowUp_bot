@@ -1,4 +1,5 @@
 import re
+import logging
 from datetime import datetime, timezone
 
 from app.config import ADMIN_DISCORD_USER_ID
@@ -55,18 +56,31 @@ from app.services.replacement_service import (
 from app.services.stats_service import get_user_month_stats
 from app.services.workout_service import complete_workout, miss_workout, shorten_workout
 
+logger = logging.getLogger(__name__)
+SAFE_ERROR = "Prepáč, toto som nezachytil správne. Skús mi to napísať ešte raz jednoduchšie."
+
 
 def execute_tool(
     tool_name: str, args: dict, discord_user_id: str
 ) -> tuple[bool, str, str]:
     """Bezpečne vykoná agentom zvolený tool cez Python pravidlá a služby."""
     try:
-        return _execute_tool(tool_name, args, discord_user_id)
-    except (TypeError, ValueError) as error:
-        return False, f"Chýbajú alebo nesedia údaje pre túto akciu: {error}", "user_error"
-    except Exception as error:
-        print(f"Tool executor chyba pri {tool_name}: {error}")
-        return False, "Akciu sa nepodarilo vykonať. Skús to znova.", "user_error"
+        logger.debug("Tool executor start tool=%s args=%s user=%s", tool_name, args, discord_user_id)
+        result = _execute_tool(tool_name, args, discord_user_id)
+        logger.debug(
+            "Tool executor result tool=%s success=%s result_type=%s result=%r",
+            tool_name,
+            result[0],
+            result[2],
+            result[1],
+        )
+        return result
+    except (TypeError, ValueError):
+        logger.exception("Tool executor validation failed tool=%s args=%s", tool_name, args)
+        return False, SAFE_ERROR, "user_error"
+    except Exception:
+        logger.exception("Tool executor failed tool=%s args=%s", tool_name, args)
+        return False, SAFE_ERROR, "user_error"
 
 
 def _execute_tool(tool_name: str, args: dict, discord_user_id: str):

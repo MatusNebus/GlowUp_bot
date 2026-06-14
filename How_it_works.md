@@ -71,8 +71,6 @@ GlowUp_bot/
     ├── database.py                          # databázové pripojenie a tabuľky
     ├── bot.py                               # Discord udalosti, príkazy a hlavné flow
     ├── ai_agent.py                          # hlavné AI rozhodovanie
-    ├── ai_router.py                         # staršia/jednoduchšia AI klasifikácia
-    ├── ai_parser.py                         # starší parser správ na intenty
     ├── tool_executor.py                     # bezpečné vykonanie AI toolov
     └── services/
         ├── users_service.py
@@ -122,6 +120,7 @@ Konfiguráciu načítava `app/config.py` zo súboru `.env`:
 | `OPENAI_API_KEY` | Kľúč pre prirodzený jazyk a trénerove AI odpovede |
 | `OPENAI_MODEL` | OpenAI model, predvolene `gpt-5.4-mini` |
 | `ADMIN_DISCORD_USER_ID` | Používateľ oprávnený na admin/debug akcie |
+| `LOG_LEVEL` | Úroveň terminálových logov, predvolene `INFO`; pre detail použi `DEBUG` |
 
 Ak chýba OpenAI kľúč, pevné príkazy stále fungujú. Nefunguje však AI pochopenie
 prirodzeného jazyka ani generovanie variabilných trénerových odpovedí.
@@ -181,7 +180,7 @@ jonas presuň mi sobotný tréning na nedeľu o desiatej
 jonas ako mám zlepšiť tempo pri behu?
 ```
 
-Takáto správa ide do `ai_agent.py`, ktorý vráti štruktúrované rozhodnutie:
+Takáto správa ide výhradne do `ai_agent.py`, ktorý vráti štruktúrované rozhodnutie:
 
 - `mode="tool"`: treba vykonať akciu,
 - `mode="reply"`: stačí konverzačná alebo tréningová odpoveď,
@@ -226,17 +225,6 @@ Tool executor je most medzi AI rozhodnutím a servisnou vrstvou:
 
 Príklad: AI vyberie `log_workout_done`, ale až `workout_service.py` overí, či
 tréning existuje, patrí autorovi a ešte sa dá upraviť.
-
-### `app/ai_router.py` a `app/ai_parser.py`
-
-Tieto moduly predstavujú staršiu alebo pomocnú AI cestu:
-
-- `ai_router.py` klasifikuje správu na route a intent,
-- `ai_parser.py` prekladá správu na staršiu schému intentov.
-
-`bot.py` ešte používa router pri debug príkaze `jonas ai test ...` a obsahuje
-pomocnú funkciu `_execute_ai_intent()`. Bežná neznáma správa však na konci
-`on_message()` ide cez novší `ai_agent.py` a `tool_executor.py`.
 
 ### `app/services/coach_responder.py`
 
@@ -373,8 +361,9 @@ Buduje textový kontext pre AI. Obsahuje:
 - otvorené zmeny a náhrady,
 - posledné správy v nastavenom Discord kanáli.
 
-Správy v hlavnom kanáli sa ukladajú do `message_memory`. Botove vlastné správy
-sa neukladajú, pretože `on_message()` ich hneď ignoruje.
+Ľudské správy aj Jonášove odpovede sa ukladajú do `message_memory`. Botove
+odpovede zapisuje helper `send_and_remember()`, pretože `on_message()` botov ignoruje.
+AI dostáva posledných päť správ kanála chronologicky.
 
 ### `stats_service.py` a `training_query_service.py`
 
@@ -602,9 +591,8 @@ rozhranie a SQLite je lokálne úložisko.
 - `app/bot.py` je veľký centrálny súbor a obsahuje veľa pevných príkazov aj
   staršiu AI cestu. Pri väčšom projekte by dávalo zmysel rozdeliť ho na command
   handlery.
-- Súčasne existujú `ai_agent.py`, `ai_router.py` a `ai_parser.py`. Hlavná cesta je
-  agent + tool executor; zvyšné dve vrstvy sú stále užitočné na debug a spätnú
-  kompatibilitu, ale zvyšujú mentálnu náročnosť.
+- Prirodzený jazyk používa iba `ai_agent.py` a `tool_executor.py`; staršie
+  paralelné AI router/parser vrstvy boli odstránené.
 - Databázové operácie otvárajú krátke samostatné SQLite spojenia. Je to
   jednoduché a vhodné pre malého bota.
 - Projekt momentálne neobsahuje automatizované testy. Pri úprave pravidiel treba
