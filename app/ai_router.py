@@ -100,7 +100,7 @@ Príklady:
 Pri odkaze na tréning použi plán z kontextu. Do plan_id vlož používateľské číslo,
 nie interné_id. Pri viacerých možnostiach nastav needs_clarification=true.
 Dni normalizuj: pondelok, utorok, streda, stvrtok, piatok, sobota, nedela.
-Čas vracaj ako HH:MM. Beh=beh, posilka=posilka, domáci tréning=domaci_trening.
+Čas vracaj ako HH:MM. Názvy aktivít preberaj z dynamického katalógu v kontexte.
 Prechádzka ako náhrada je tool_action s intent=forbidden_walk_replacement.
 response_hint stručne zhrnie, čo má finálna odpoveď povedať; pri context_question
 v ňom uveď presnú odpoveď podľa posledných správ.

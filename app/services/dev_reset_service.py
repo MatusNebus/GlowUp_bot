@@ -43,6 +43,7 @@ def reset_all() -> tuple[bool, str]:
     """Vymaže všetky používateľské dáta projektu."""
     with get_connection() as connection:
         for table in (
+            "workout_log_values",
             "workout_replacement_votes",
             "workout_replacement_requests",
             "commitment_change_votes",
@@ -56,7 +57,10 @@ def reset_all() -> tuple[bool, str]:
             "message_memory",
             "pending_actions",
             "notification_log",
-            "approved_activity_types",
+            "activity_change_requests",
+            "activity_fields",
+            "activity_versions",
+            "activity_types",
             "users",
         ):
             connection.execute(f"DELETE FROM {table}")
@@ -115,6 +119,13 @@ def _delete_user_data(connection, user_id: int, discord_user_id: str) -> None:
     connection.execute(
         "DELETE FROM commitment_change_votes WHERE voter_discord_user_id = ?",
         (discord_user_id,),
+    )
+    connection.execute(
+        """
+        DELETE FROM workout_log_values
+        WHERE workout_log_id IN (SELECT id FROM workout_logs WHERE user_id = ?)
+        """,
+        (user_id,),
     )
     connection.execute("DELETE FROM workout_logs WHERE user_id = ?", (user_id,))
     connection.execute("DELETE FROM jokers WHERE user_id = ?", (user_id,))

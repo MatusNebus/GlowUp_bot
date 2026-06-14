@@ -2,6 +2,7 @@ from datetime import datetime, timezone
 
 from app.database import get_connection
 from app.services.commitments_service import set_commitment
+from app.services.activity_service import get_active_activity
 
 
 def request_commitment_change(
@@ -15,17 +16,21 @@ def request_commitment_change(
         return False, "Počet tréningov musí byť väčší ako 0."
 
     with get_connection() as connection:
+        activity = get_active_activity(workout_type, connection)
+        if activity is None:
+            return False, f"Aktivita `{workout_type}` nie je v aktívnom katalógu."
+        normalized_type = activity["display_name"]
         user = connection.execute(
             """
             SELECT users.id, users.display_name, commitments.count_per_week
             FROM users
             LEFT JOIN commitments
               ON commitments.user_id = users.id
-             AND commitments.workout_type = ?
+             AND commitments.activity_type_id = ?
              AND commitments.is_active = 1
             WHERE users.discord_user_id = ? AND users.is_active = 1
             """,
-            (normalized_type, requester_discord_user_id),
+            (activity["id"], requester_discord_user_id),
         ).fetchone()
         if user is None:
             return False, "Najprv sa musíš registrovať."

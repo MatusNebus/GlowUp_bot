@@ -3,24 +3,15 @@ from datetime import datetime, timezone
 
 from app.database import get_connection
 from app.services.pending_actions_service import create_pending_action
+from app.services.activity_service import get_active_activity
 from app.services.planning_service import (
     get_current_week_start,
-    is_forbidden_walk_type,
     is_valid_time,
     normalize_day,
     resolve_plan_reference,
 )
 
 
-KNOWN_ACTIVITIES = {
-    "beh",
-    "posilka",
-    "domaci_trening",
-    "bicykel",
-    "plavanie",
-    "beachvolejbal",
-    "basketbal",
-}
 EDITABLE_STATUSES = {"planned", "postponed", "unanswered"}
 
 
@@ -35,21 +26,10 @@ def request_workout_replacement(
 ) -> tuple[bool, str]:
     """Vytvorí auditovaný návrh náhrady bez okamžitej zmeny plánu."""
     normalized_type = replacement_workout_type.strip().casefold()
-    if is_forbidden_walk_type(normalized_type):
-        return (
-            False,
-            "Prechádzka sa podľa pravidiel Couple GlowUp neráta ako tréning "
-            "a nemôže byť náhradou.",
-        )
-    if not _is_known_activity(normalized_type):
-        create_pending_action(
-            requester_discord_user_id,
-            "new_activity_decision",
-            f"Náhradná aktivita: {normalized_type}",
-            ["admin_decision"],
-            {"workout_type": normalized_type},
-        )
-        return False, f"Aktivita `{normalized_type}` ešte nie je schválená."
+    with get_connection() as connection:
+        replacement_activity = get_active_activity(normalized_type, connection)
+    if replacement_activity is None:
+        return False, f"Aktivita `{normalized_type}` nie je v aktívnom katalógu."
 
     try:
         normalized_day = normalize_day(replacement_day)
@@ -96,15 +76,17 @@ def request_workout_replacement(
             """
             INSERT INTO workout_replacement_requests (
                 requester_discord_user_id, original_weekly_plan_id,
-                replacement_workout_type, replacement_day, replacement_time,
+                replacement_activity_version_id, replacement_workout_type,
+                replacement_day, replacement_time,
                 reason, status, created_at
             )
-            VALUES (?, ?, ?, ?, ?, ?, 'open', ?)
+            VALUES (?, ?, ?, ?, ?, ?, ?, 'open', ?)
             """,
             (
                 requester_discord_user_id,
                 plan["id"],
-                normalized_type,
+                replacement_activity["current_version_id"],
+                replacement_activity["display_name"],
                 normalized_day,
                 replacement_time,
                 reason.strip(),
@@ -129,7 +111,7 @@ def request_workout_replacement(
         True,
         f"Návrh náhrady tréningu #{request_id}: {user['display_name']} chce nahradiť "
         f"{plan['workout_type']} v {plan['planned_day']} {plan['planned_time']} za "
-        f"{normalized_type} v {normalized_day} {replacement_time}. Dôvod: {reason.strip()}. "
+        f"{replacement_activity['display_name']} v {normalized_day} {replacement_time}. Dôvod: {reason.strip()}. "
         "Zmena prejde až po súhlase všetkých aktívnych používateľov.\n"
         f"Schválenie: jonas approve replacement {request_id}\n"
         f"Odmietnutie: jonas reject replacement {request_id}",
@@ -334,13 +316,14 @@ def _apply_if_unanimous(request_id: int) -> tuple[bool, str]:
         connection.execute(
             """
             INSERT INTO weekly_plans (
-                user_id, week_start, workout_type, planned_day,
+                user_id, activity_version_id, week_start, workout_type, planned_day,
                 planned_time, status, created_at
             )
-            VALUES (?, ?, ?, ?, ?, 'planned', ?)
+            VALUES (?, ?, ?, ?, ?, ?, 'planned', ?)
             """,
             (
                 plan["user_id"],
+                request["replacement_activity_version_id"],
                 plan["week_start"],
                 request["replacement_workout_type"],
                 request["replacement_day"],
@@ -378,14 +361,3 @@ def _owned_plan(connection, discord_user_id: str, plan_id: int):
 def _normalize(text: str) -> str:
     decomposed = unicodedata.normalize("NFKD", str(text).casefold())
     return "".join(char for char in decomposed if not unicodedata.combining(char))
-
-
-def _is_known_activity(workout_type: str) -> bool:
-    if workout_type in KNOWN_ACTIVITIES:
-        return True
-    with get_connection() as connection:
-        approved = connection.execute(
-            "SELECT id FROM approved_activity_types WHERE workout_type = ?",
-            (workout_type,),
-        ).fetchone()
-    return approved is not None

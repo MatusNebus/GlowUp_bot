@@ -2,6 +2,7 @@ from datetime import date, datetime, timedelta, timezone
 
 from app.database import get_connection
 from app.services.planning_service import DAY_ORDER, get_current_week_start
+from app.services.activity_service import list_activities
 
 
 def save_channel_message(
@@ -91,7 +92,7 @@ def build_ai_context(
 
         plans = connection.execute(
             """
-            SELECT id, workout_type, planned_day, planned_time, status
+            SELECT id, activity_version_id, workout_type, planned_day, planned_time, status
             FROM weekly_plans
             WHERE user_id = ? AND week_start = ?
             """,
@@ -129,6 +130,16 @@ def build_ai_context(
             FROM workout_replacement_requests
             WHERE status = 'open'
             ORDER BY id ASC
+            """
+        ).fetchall()
+        activity_changes = connection.execute(
+            """
+            SELECT r.id, r.change_type, v.display_name
+            FROM activity_change_requests r
+            JOIN activity_types a ON a.id = r.activity_type_id
+            JOIN activity_versions v ON v.id = a.current_version_id
+            WHERE r.status = 'open'
+            ORDER BY r.id
             """
         ).fetchall()
 
@@ -169,6 +180,8 @@ def build_ai_context(
         memories,
         open_changes,
         open_replacements,
+        list_activities(),
+        activity_changes,
     )
 
 
@@ -182,6 +195,8 @@ def _format_context(
     memories,
     open_changes=(),
     open_replacements=(),
+    activities=(),
+    activity_changes=(),
 ) -> str:
     lines = [
         "KONTEXT PRE AI - používaj ho iba na pochopenie správy:",
@@ -250,4 +265,26 @@ def _format_context(
             lines.append(f"- {author}{own}: {memory['message_text']}")
     else:
         lines.append("- bez uloženej histórie")
+    lines.extend(["", "Aktívny katalóg aktivít:"])
+    if activities:
+        for activity in activities:
+            fields = ", ".join(
+                f"{field['field_key']}:{field['field_type']}"
+                + (f"[{field['unit']}]" if field["unit"] else "")
+                for field in activity["fields"]
+            )
+            lines.append(
+                f"- {activity['display_name']} (slug={activity['slug']}, polia={fields})"
+            )
+    else:
+        lines.append("- prázdny")
+    lines.extend(["", "Otvorené návrhy zmien aktivít:"])
+    if activity_changes:
+        for change in activity_changes:
+            lines.append(
+                f"- request_id={change['id']}; aktivita={change['display_name']}; "
+                f"typ_zmeny={change['change_type']}"
+            )
+    else:
+        lines.append("- žiadne")
     return "\n".join(lines)

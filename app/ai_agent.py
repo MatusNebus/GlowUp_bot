@@ -5,6 +5,7 @@ from openai import OpenAI
 
 from app.ai_parser import AI_NOT_CONFIGURED_MESSAGE, OpenAIKeyMissingError
 from app.config import OPENAI_API_KEY, OPENAI_MODEL
+from app.services.rules_service import get_rules
 
 
 TOOLS = [
@@ -20,9 +21,6 @@ TOOLS = [
     "log_workout_done",
     "log_workout_short",
     "log_workout_missed",
-    "edit_run_result",
-    "edit_strength_result",
-    "edit_workout_note",
     "undo_last_action",
     "use_joker",
     "get_joker_status",
@@ -40,9 +38,13 @@ TOOLS = [
     "confirm_onboarding",
     "reset_onboarding",
     "list_activity_types",
-    "request_new_activity_decision",
-    "list_pending_decisions",
-    "resolve_decision",
+    "create_activity",
+    "request_activity_edit",
+    "request_activity_deactivation",
+    "approve_activity_change",
+    "reject_activity_change",
+    "query_training_data",
+    "get_rules",
     "show_help",
     "answer_general_training_question",
     "casual_reply",
@@ -52,6 +54,47 @@ TOOLS = [
 
 def _nullable(value_type: str) -> dict:
     return {"anyOf": [{"type": value_type}, {"type": "null"}]}
+
+
+ACTIVITY_FIELDS_SCHEMA = {
+    "type": "array",
+    "items": {
+        "type": "object",
+        "properties": {
+            "field_key": {"type": "string"},
+            "display_name": {"type": "string"},
+            "field_type": {"type": "string", "enum": ["number", "duration", "text", "rating"]},
+            "unit": _nullable("string"),
+        },
+        "required": ["field_key", "display_name", "field_type", "unit"],
+        "additionalProperties": False,
+    },
+}
+
+RESULT_VALUES_SCHEMA = {
+    "type": "array",
+    "items": {
+        "type": "object",
+        "properties": {"field_key": {"type": "string"}, "value": {"type": "string"}},
+        "required": ["field_key", "value"],
+        "additionalProperties": False,
+    },
+}
+
+QUERY_SCHEMA = {
+    "type": "object",
+    "properties": {
+        "scope": {"type": "string", "enum": ["self", "group"]},
+        "activity": _nullable("string"),
+        "date_from": _nullable("string"),
+        "date_to": _nullable("string"),
+        "statuses": {"type": "array", "items": {"type": "string"}},
+        "field_key": _nullable("string"),
+        "aggregation": {"type": "string", "enum": ["count", "sum", "average", "min", "max"]},
+    },
+    "required": ["scope", "activity", "date_from", "date_to", "statuses", "field_key", "aggregation"],
+    "additionalProperties": False,
+}
 
 
 ARGS_SCHEMA = {
@@ -72,6 +115,11 @@ ARGS_SCHEMA = {
         "question": _nullable("string"),
         "original_description": _nullable("string"),
         "reason": _nullable("string"),
+        "activity_name": _nullable("string"),
+        "new_activity_name": _nullable("string"),
+        "activity_fields": ACTIVITY_FIELDS_SCHEMA,
+        "result_values": RESULT_VALUES_SCHEMA,
+        "query": QUERY_SCHEMA,
     },
     "required": [
         "plan_ref",
@@ -89,6 +137,11 @@ ARGS_SCHEMA = {
         "question",
         "original_description",
         "reason",
+        "activity_name",
+        "new_activity_name",
+        "activity_fields",
+        "result_values",
+        "query",
     ],
     "additionalProperties": False,
 }
@@ -128,9 +181,8 @@ priamu odpoveď alebo doplňujúcu otázku. Nikdy nemeníš databázu sám.
 Podporované tools:
 {", ".join(TOOLS)}
 
-Pravidlá:
+Rozhodovacie pravidlá:
 - Používaj používateľské čísla tréningov 1..n z kontextu, nikdy interné_id.
-- Prechádzka nie je náhrada tréningu.
 - Objektívnu náhradu tréningu rieš cez request_workout_replacement. Agent iba vytvorí
   request; nikdy ju sám neschvaľuje.
 - Pri request_workout_replacement vyplň plan_ref, ak vieš jednoznačne nájsť pôvodný
@@ -149,6 +201,20 @@ Pravidlá:
 - Pri otázke o tréningu, výžive alebo motivácii vyber answer_general_training_question.
 - Pri bežnom rozhovore vyber casual_reply.
 - Pri otázke ako aplikáciu používať vyber show_help.
+- Pri otázke na pravidlá vždy vyber get_rules.
+- Pri otázke na známe aktivity vyber list_activity_types.
+- Novú aktivitu vždy rieš cez create_activity, aj keď chýba názov alebo polia.
+  Polia mapuj na number, duration, text alebo rating. Python uloží rozpracovanie
+  a jednou otázkou si vypýta názov aj všetky chýbajúce parametre.
+- Úpravu aktivity rieš request_activity_edit, odstránenie request_activity_deactivation.
+  Pri úprave parametrov pošli kompletnú požadovanú novú schému, nie iba zmenené pole.
+  Adminov súhlas rieš approve_activity_change alebo reject_activity_change.
+- Pri zápise výsledku použi result_values podľa field_key z katalógu v kontexte.
+  Trvanie normalizuj na číselnú hodnotu v jednotke uvedenej pri poli.
+  Ak je otvorená pending akcia complete_workout_result, doplň chýbajúce result_values
+  a znova vyber pôvodný tool zápisu výsledku.
+- Otázky na ľubovoľné súčty, priemery, minimum, maximum alebo počty tréningových dát
+  rieš cez query_training_data. Nikdy nevytváraj SQL.
 - Ak chýbajú nutné údaje alebo je viac možností, mode=clarify.
 - Systémové informácie majú neutral tón. Splnenie môže byť supportive, vynechanie strict.
 - Dni normalizuj na pondelok, utorok, streda, stvrtok, piatok, sobota, nedela.
@@ -174,7 +240,7 @@ def decide_agent_action(
             f"Dátum: {date.today().isoformat()}\n"
             f"Autor: {author_display_name}\n"
             f"Aktuálna správa: {message_text}\n\n"
-            f"{context_text}\n\n{pending_action_text}"
+            f"{context_text}\n\n{pending_action_text}\n\nAKTUÁLNE PRAVIDLÁ:\n{get_rules()}"
         ),
         text={
             "format": {

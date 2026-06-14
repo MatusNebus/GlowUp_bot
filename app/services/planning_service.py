@@ -3,17 +3,9 @@ import unicodedata
 from datetime import date, datetime, timezone
 
 from app.database import get_connection
-from app.services.commitments_service import WALK_REJECTION_MESSAGE
+from app.services.activity_service import get_active_activity
 
 
-FORBIDDEN_WALK_TYPES = {
-    "prechadzka",
-    "prechádzka",
-    "walk",
-    "walking",
-    "chôdza",
-    "chodza",
-}
 VALID_DAYS = {
     "pondelok",
     "utorok",
@@ -53,21 +45,11 @@ def normalize_day(day_text: str) -> str:
     return normalized
 
 
-def is_forbidden_walk_type(workout_type: str) -> bool:
-    normalized_type = workout_type.strip().casefold()
-    return normalized_type in FORBIDDEN_WALK_TYPES
-
-
 def add_plan(
     discord_user_id: str, workout_type: str, planned_day: str, planned_time: str
 ) -> tuple[bool, str]:
     """Pridá tréning do aktuálneho týždenného plánu podľa existujúceho záväzku."""
-    normalized_type = workout_type.strip().casefold()
-
-    if is_forbidden_walk_type(normalized_type):
-        return False, WALK_REJECTION_MESSAGE
-
-    if not normalized_type:
+    if not workout_type.strip():
         return False, PLAN_FORMAT_MESSAGE
 
     try:
@@ -85,13 +67,17 @@ def add_plan(
         if user is None:
             return False, "Najprv sa musíš registrovať. Skús: jonas register Matúš"
 
+        activity = get_active_activity(workout_type, connection)
+        if activity is None:
+            return False, f"Aktivita `{workout_type}` nie je v aktívnom katalógu."
+
         commitment = connection.execute(
             """
             SELECT count_per_week
             FROM commitments
-            WHERE user_id = ? AND workout_type = ? AND is_active = 1
+            WHERE user_id = ? AND activity_type_id = ? AND is_active = 1
             """,
-            (user["id"], normalized_type),
+            (user["id"], activity["id"]),
         ).fetchone()
 
         if commitment is None:
@@ -107,10 +93,12 @@ def add_plan(
             FROM weekly_plans
             WHERE user_id = ?
               AND week_start = ?
-              AND workout_type = ?
+              AND activity_version_id IN (
+                  SELECT id FROM activity_versions WHERE activity_type_id = ?
+              )
               AND status != 'missed'
             """,
-            (user["id"], week_start, normalized_type),
+            (user["id"], week_start, activity["id"]),
         ).fetchone()["plan_count"]
 
         if planned_count >= commitment["count_per_week"]:
@@ -124,18 +112,20 @@ def add_plan(
             """
             INSERT INTO weekly_plans (
                 user_id,
+                activity_version_id,
                 week_start,
                 workout_type,
                 planned_day,
                 planned_time,
                 created_at
             )
-            VALUES (?, ?, ?, ?, ?, ?)
+            VALUES (?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 user["id"],
+                activity["current_version_id"],
                 week_start,
-                normalized_type,
+                activity["display_name"],
                 normalized_day,
                 planned_time,
                 datetime.now(timezone.utc).isoformat(),
@@ -147,7 +137,7 @@ def add_plan(
     return (
         True,
         f"{user['display_name']} má naplánované [{plan_ref}]: "
-        f"{normalized_type}, {normalized_day} o {planned_time}.",
+        f"{activity['display_name']}, {normalized_day} o {planned_time}.",
     )
 
 
@@ -188,7 +178,7 @@ def weekly_status(discord_user_id: str) -> tuple[bool, str]:
 
         commitments = connection.execute(
             """
-            SELECT workout_type, count_per_week
+            SELECT activity_type_id, workout_type, count_per_week
             FROM commitments
             WHERE user_id = ? AND is_active = 1
             ORDER BY workout_type ASC
@@ -205,23 +195,24 @@ def weekly_status(discord_user_id: str) -> tuple[bool, str]:
 
         planned_counts = connection.execute(
             """
-            SELECT workout_type, COUNT(*) AS plan_count
+            SELECT versions.activity_type_id, COUNT(*) AS plan_count
             FROM weekly_plans
-            WHERE user_id = ?
-              AND week_start = ?
-              AND status != 'missed'
-            GROUP BY workout_type
+            JOIN activity_versions versions ON versions.id = weekly_plans.activity_version_id
+            WHERE weekly_plans.user_id = ?
+              AND weekly_plans.week_start = ?
+              AND weekly_plans.status != 'missed'
+            GROUP BY versions.activity_type_id
             """,
             (user["id"], week_start),
         ).fetchall()
 
-    counts_by_type = {row["workout_type"]: row["plan_count"] for row in planned_counts}
+    counts_by_type = {row["activity_type_id"]: row["plan_count"] for row in planned_counts}
 
     lines = [f"{user['display_name']} — stav plánovania:"]
     for commitment in commitments:
         workout_type = commitment["workout_type"]
         required_count = commitment["count_per_week"]
-        planned_count = counts_by_type.get(workout_type, 0)
+        planned_count = counts_by_type.get(commitment["activity_type_id"], 0)
         missing_count = max(required_count - planned_count, 0)
         suffix = "hotovo" if missing_count == 0 else f"chýba {missing_count}"
 

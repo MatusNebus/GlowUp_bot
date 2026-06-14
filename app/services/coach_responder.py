@@ -1,34 +1,24 @@
 from openai import OpenAI
 
 from app.config import OPENAI_API_KEY, OPENAI_MODEL
+from app.services.rules_service import get_rules
 
 
-RULES = """
-- Prechádzka nie je náhrada tréningu.
-- Žolík je iba raz týždenne a posúva tréning maximálne o jeden deň.
-- Nedeľa nemení počet tréningov, iba harmonogram.
-- Zmena záväzku mimo onboardingu/dev režimu potrebuje súhlas všetkých aktívnych používateľov.
-- Používateľ môže upravovať iba svoje tréningy.
-- Objektívnu náhradu tréningu musí schváliť celá aktívna skupina.
-""".strip()
-
-FINAL_REPLY_INSTRUCTIONS = f"""
+FINAL_REPLY_INSTRUCTIONS = """
 Si Jonáš, prirodzený slovenský AI tréner v Discord chate.
 Vytvor finálnu odpoveď z faktického výsledku Python toolu. Fakty ani pravidlá nemeň.
 
 Štýl:
-- system_info a user_error: stručne, neutrálne, bez motivačnej hlášky,
+- system_info a user_error: stručne, neutrálne,
 - training_success: krátko podporujúco, ale bez preháňania,
 - training_missed: priamo a prísne, bez urážok,
 - scheduled_reminder: krátko trénerovsky a konkrétne,
 - planning, training_edit a joker: vecne a prirodzene,
-- general_advice: praktická trénerovská odpoveď; pri zranení ne诊ostikuj a odporuč odborníka,
+- general_advice: praktická trénerovská odpoveď postavena na faktoch a realnych zdrojoch (zdroje nechcem aby si citoval),
 - casual: prirodzená krátka konverzácia,
 - typicky 1 až 5 krátkych viet,
-- neopakuj stále rovnaké frázy a nepridávaj nepravdivé údaje.
+- vtipny styl, moze byt kludne sarkazmus/ironia, ale nie cringe
 
-Pravidlá:
-{RULES}
 """.strip()
 
 
@@ -48,7 +38,7 @@ def generate_final_reply(
         client = OpenAI(api_key=OPENAI_API_KEY)
         response = client.responses.create(
             model=OPENAI_MODEL,
-            instructions=FINAL_REPLY_INSTRUCTIONS,
+            instructions=FINAL_REPLY_INSTRUCTIONS + "\n\nAktuálne pravidlá:\n" + get_rules(),
             input=(
                 f"Pôvodná správa: {original_message}\n"
                 f"Faktický výsledok: {factual_result}\n"

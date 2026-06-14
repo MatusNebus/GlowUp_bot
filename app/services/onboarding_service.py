@@ -5,6 +5,7 @@ from datetime import datetime, timezone
 
 from app.database import get_connection
 from app.services.commitments_service import set_commitment
+from app.services.activity_service import list_activities
 
 
 WELCOME_MESSAGE = """Vitaj v Couple GlowUp.
@@ -26,20 +27,6 @@ UNCLEAR_MESSAGE = (
     "chcem 2x beh a 2x posilku. Ak chceš úplný základ, odporúčam "
     "2x beh a 1x domáci tréning."
 )
-
-ACTIVITY_ALIASES = {
-    "beh": ("beh", "behy", "behat"),
-    "posilka": ("posilka", "posilku", "silovy trening", "gym"),
-    "domaci_trening": (
-        "domaci trening",
-        "cvicenie doma",
-        "vlastna vaha",
-    ),
-    "bicykel": ("bicykel", "cyklistika"),
-    "plavanie": ("plavanie",),
-    "beachvolejbal": ("beachvolejbal", "beach volejbal"),
-}
-
 
 def start_onboarding(discord_user_id: str) -> tuple[bool, str]:
     """Spustí krátky onboarding a vymaže starý nepotvrdený návrh."""
@@ -162,7 +149,7 @@ def has_active_onboarding(discord_user_id: str) -> bool:
 
 
 def parse_commitments(answer: str) -> dict[str, int]:
-    """Jednoduchý parser podporujúci bežné slovenské tvary a poradie počtu."""
+    """Parse counts only for activities currently present in the catalog."""
     normalized = _normalize(answer).replace("×", "x")
     number_matches = list(re.finditer(r"\b(\d+)\s*x?\b", normalized))
     if not number_matches:
@@ -170,7 +157,9 @@ def parse_commitments(answer: str) -> dict[str, int]:
 
     proposal = {}
     used_numbers: set[int] = set()
-    for workout_type, aliases in ACTIVITY_ALIASES.items():
+    for activity in list_activities():
+        workout_type = activity["display_name"]
+        aliases = (_normalize(activity["display_name"]), _normalize(activity["slug"]))
         alias_matches = [
             match
             for alias in aliases

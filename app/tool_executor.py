@@ -3,6 +3,15 @@ from datetime import datetime, timezone
 
 from app.config import ADMIN_DISCORD_USER_ID
 from app.database import get_connection
+from app.services.activity_service import (
+    create_activity,
+    format_activities,
+    request_activity_change,
+    resolve_activity_change,
+)
+from app.services.capabilities_service import get_help
+from app.services.rules_service import get_rules
+from app.services.training_query_service import query_training_data
 from app.services.commitment_change_service import list_changes, request_commitment_change, vote_change
 from app.services.commitments_service import list_commitments
 from app.services.joker_service import joker_status, use_joker
@@ -38,18 +47,6 @@ from app.services.replacement_service import (
 )
 from app.services.stats_service import get_user_month_stats
 from app.services.workout_service import complete_workout, miss_workout, shorten_workout
-
-
-ACTIVITY_TYPES = (
-    "beh, posilka, domaci_trening, bicykel, plavanie, beachvolejbal"
-)
-HELP_TEXT = (
-    "Začni onboardingom, nastav si týždenné záväzky a potom tréningy rozlož do dní. "
-    "Po tréningu zapíš výsledok alebo vynechanie. Žolík môže raz týždenne posunúť "
-    "tréning najviac o deň. Plán a čísla tréningov ukáže `jonas my week`, "
-    "štatistiky `jonas stats`. Objektívnu náhradu tréningu musí schváliť celá "
-    "aktívna skupina. Prechádzka sa neráta ako náhrada tréningu."
-)
 
 
 def execute_tool(
@@ -101,12 +98,6 @@ def _execute_tool(tool_name: str, args: dict, discord_user_id: str):
     if tool_name == "log_workout_missed":
         plan_id = _resolve_ref(discord_user_id, _required_int(args, "plan_ref"))
         return _service_result(miss_workout(discord_user_id, plan_id), "training_missed")
-    if tool_name == "edit_run_result":
-        return _edit_run_result(discord_user_id, args)
-    if tool_name == "edit_strength_result":
-        return _edit_strength_result(discord_user_id, args)
-    if tool_name == "edit_workout_note":
-        return _edit_note(discord_user_id, args)
     if tool_name == "undo_last_action":
         pending = get_latest_pending_action(discord_user_id)
         if pending is None:
@@ -176,24 +167,47 @@ def _execute_tool(tool_name: str, args: dict, discord_user_id: str):
     if tool_name == "reset_onboarding":
         return _service_result(reset_onboarding(discord_user_id), "system_info")
     if tool_name == "list_activity_types":
-        return True, f"Podporované aktivity: {ACTIVITY_TYPES}.", "system_info"
-    if tool_name == "request_new_activity_decision":
-        activity = args.get("workout_type") or "neznáma aktivita"
-        decision = create_pending_action(
-            discord_user_id,
-            "new_activity_decision",
-            f"Žiadosť o novú aktivitu: {activity}",
-            ["admin_decision"],
-            {"workout_type": activity},
-        )
-        return (
-            True,
-            f"Rozhodnutie #{decision['id']} pre aktivitu `{activity}` čaká na admina.",
+        return True, format_activities(), "system_info"
+    if tool_name == "create_activity":
+        return _create_activity_tool(discord_user_id, args)
+    if tool_name == "request_activity_edit":
+        return _service_result(
+            request_activity_change(
+                discord_user_id,
+                _required(args, "activity_name"),
+                "edit",
+                args.get("new_activity_name"),
+                args.get("activity_fields") or [],
+            ),
             "system_info",
         )
-    if tool_name == "list_pending_decisions":
-        return True, _list_pending_decisions(), "system_info"
-    if tool_name == "resolve_decision":
+    if tool_name == "request_activity_deactivation":
+        return _service_result(
+            request_activity_change(
+                discord_user_id, _required(args, "activity_name"), "deactivate"
+            ),
+            "system_info",
+        )
+    if tool_name in {"approve_activity_change", "reject_activity_change"}:
+        return _service_result(
+            resolve_activity_change(
+                discord_user_id,
+                _required_int(args, "request_id"),
+                tool_name.startswith("approve"),
+            ),
+            "system_info",
+        )
+    if tool_name == "query_training_data":
+        return _service_result(
+            query_training_data(discord_user_id, args.get("query") or {}),
+            "stats",
+        )
+    if tool_name == "get_rules":
+        return True, get_rules(), "system_info"
+    if tool_name == "legacy_list_pending_decisions":
+        return False, "Starý zoznam rozhodnutí už nie je podporovaný.", "user_error"
+    if tool_name == "legacy_resolve_decision":
+        return False, "Staré rozhodnutia už nie sú podporované.", "user_error"
         if not ADMIN_DISCORD_USER_ID or discord_user_id != ADMIN_DISCORD_USER_ID.strip():
             return False, "Toto rozhodnutie môže uzavrieť iba admin.", "user_error"
         decision_id = _required_int(args, "decision_id")
@@ -211,7 +225,7 @@ def _execute_tool(tool_name: str, args: dict, discord_user_id: str):
                 with get_connection() as connection:
                     connection.execute(
                         """
-                        INSERT INTO approved_activity_types (
+                        INSERT INTO legacy_removed_activity_types (
                             workout_type, approved_by_discord_user_id, approved_at
                         )
                         VALUES (?, ?, ?)
@@ -228,7 +242,7 @@ def _execute_tool(tool_name: str, args: dict, discord_user_id: str):
         resolve_pending_action(decision_id)
         return True, f"Rozhodnutie #{decision_id} bolo uzavreté: {answer}.", "system_info"
     if tool_name == "show_help":
-        return True, HELP_TEXT, "system_info"
+        return True, get_help(), "system_info"
     if tool_name == "answer_general_training_question":
         return True, args.get("question") or args.get("answer") or "", "general_advice"
     if tool_name == "casual_reply":
@@ -293,6 +307,32 @@ def _move_workout(discord_user_id: str, args: dict) -> tuple[bool, str, str]:
     return True, f"Tréning [{plan_ref}] je presunutý na {new_day} {new_time}.", "planning"
 
 
+def _create_activity_tool(discord_user_id: str, args: dict) -> tuple[bool, str, str]:
+    pending = get_latest_pending_action(discord_user_id)
+    name = args.get("activity_name")
+    fields = args.get("activity_fields") or []
+    if pending and pending["intent"] == "create_activity":
+        name = name or pending["parsed_json"].get("activity_name")
+        fields = fields or pending["parsed_json"].get("activity_fields") or []
+    if not name or not fields:
+        create_pending_action(
+            discord_user_id,
+            "create_activity",
+            "Vytvorenie novej aktivity",
+            [item for item, value in (("activity_name", name), ("activity_fields", fields)) if not value],
+            {"activity_name": name, "activity_fields": fields},
+        )
+        return (
+            False,
+            "Napíš v jednej správe názov aktivity a všetky údaje, ktoré sa majú po tréningu zapisovať.",
+            "clarify",
+        )
+    result = create_activity(discord_user_id, str(name), fields)
+    if result[0] and pending and pending["intent"] == "create_activity":
+        resolve_pending_action(pending["id"])
+    return _service_result(result, "system_info")
+
+
 def _confirmed_joker_move(discord_user_id: str, args: dict) -> tuple[bool, str, str]:
     pending = get_latest_pending_action(discord_user_id)
     joker_args = dict(args)
@@ -335,62 +375,49 @@ def _set_workout_status(discord_user_id: str, args: dict):
 
 def _workout_result(function, discord_user_id: str, args: dict, result_type: str):
     plan_id = _resolve_ref(discord_user_id, _required_int(args, "plan_ref"))
-    return _service_result(
-        function(discord_user_id, plan_id, _required(args, "result_text")), result_type
-    )
+    pending = get_latest_pending_action(discord_user_id)
+    result_values = args.get("result_values") or []
+    if pending and pending["intent"] == "complete_workout_result":
+        old_values = pending["parsed_json"].get("result_values") or []
+        by_key = {item["field_key"]: item for item in old_values}
+        by_key.update({item["field_key"]: item for item in result_values})
+        result_values = list(by_key.values())
+    result = result_values or _required(args, "result_text")
+    service_result = function(discord_user_id, plan_id, result)
+    if service_result[0]:
+        if pending and pending["intent"] == "complete_workout_result":
+            resolve_pending_action(pending["id"])
+        return _service_result(service_result, result_type)
+    if "Potrebujem všetky výsledky:" in service_result[1]:
+        create_pending_action(
+            discord_user_id,
+            "complete_workout_result",
+            service_result[1],
+            ["result_values"],
+            {
+                "plan_ref": args.get("plan_ref"),
+                "result_values": result_values,
+                "tool": "log_workout_short" if result_type == "training_edit" else "log_workout_done",
+            },
+        )
+        return False, service_result[1], "clarify"
+    return _service_result(service_result, result_type)
 
 
 def _edit_run_result(discord_user_id: str, args: dict):
-    numbers = re.findall(r"\d+(?:[.,]\d+)?", _required(args, "result_text"))
-    if len(numbers) < 2:
-        return False, "Pri behu potrebujem kilometre a čas v minútach.", "user_error"
-    return _update_log(
-        discord_user_id,
-        _required_int(args, "plan_ref"),
-        {"distance_km": float(numbers[0].replace(",", ".")), "duration_minutes": float(numbers[1].replace(",", "."))},
-    )
+    return False, "Použi dynamické parametre aktivity pri novom zápise.", "user_error"
 
 
 def _edit_strength_result(discord_user_id: str, args: dict):
-    text = _required(args, "result_text")
-    exercises = len([part for part in text.split(";") if part.strip()]) or None
-    sets = re.findall(r"(\d+)\s*[x×]\s*\d+", text.casefold())
-    return _update_log(
-        discord_user_id,
-        _required_int(args, "plan_ref"),
-        {
-            "exercises_text": text,
-            "exercise_count": exercises,
-            "set_count": sum(map(int, sets)) if sets else None,
-        },
-    )
+    return False, "Použi dynamické parametre aktivity pri novom zápise.", "user_error"
 
 
 def _edit_note(discord_user_id: str, args: dict):
-    return _update_log(
-        discord_user_id,
-        _required_int(args, "plan_ref"),
-        {"note": _required(args, "note")},
-    )
+    return False, "Použi dynamické parametre aktivity pri novom zápise.", "user_error"
 
 
 def _update_log(discord_user_id: str, plan_ref: int, values: dict):
-    plan_id = _resolve_ref(discord_user_id, plan_ref)
-    with get_connection() as connection:
-        plan = _owned_plan(connection, discord_user_id, plan_id)
-        if isinstance(plan, str):
-            return False, plan, "user_error"
-        log = connection.execute(
-            "SELECT id FROM workout_logs WHERE weekly_plan_id = ?", (plan_id,)
-        ).fetchone()
-        if log is None:
-            return False, "Tento tréning ešte nemá uložený výsledok.", "user_error"
-        assignments = ", ".join(f"{key} = ?" for key in values)
-        connection.execute(
-            f"UPDATE workout_logs SET {assignments} WHERE id = ?",
-            (*values.values(), log["id"]),
-        )
-    return True, f"Výsledok tréningu [{plan_ref}] bol upravený.", "training_edit"
+    return False, "Úprava starého formátu výsledkov už nie je podporovaná.", "user_error"
 
 
 def _owned_plan(connection, discord_user_id: str, plan_id: int):

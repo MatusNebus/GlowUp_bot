@@ -5,6 +5,7 @@ from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 from app.config import BOT_TIMEZONE, DISCORD_CHANNEL_ID
 from app.database import get_connection
 from app.services.coach_responder import generate_final_reply
+from app.services.activity_service import format_result_prompt
 from app.services.planning_service import DAY_ORDER
 
 
@@ -113,7 +114,9 @@ async def send_post_workout_checks(client, now: datetime) -> None:
 
         factual_message = (
             f"{plan['display_name']}, {_had_workout_form(plan['display_name'])} tréning. "
-            f"Splnené? Zapíš výsledok napríklad: jonas done {plan['plan_ref']} <výsledok>, "
+            f"Splnené? Zapíš naraz tieto povinné výsledky: "
+            f"{format_result_prompt(plan['activity_version_id'])}. "
+            f"Použi: jonas done {plan['plan_ref']} <výsledky>, "
             f"alebo ak to nevyšlo: jonas missed {plan['plan_ref']}"
         )
         await channel.send(await _scheduled_reply(factual_message, "coach"))
@@ -250,6 +253,7 @@ def get_plans_for_date(target_date: date) -> list[dict]:
                 weekly_plans.planned_day,
                 weekly_plans.planned_time,
                 weekly_plans.workout_type,
+                weekly_plans.activity_version_id,
                 weekly_plans.status,
                 users.display_name
             FROM weekly_plans

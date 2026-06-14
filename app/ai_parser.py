@@ -88,15 +88,12 @@ Normalizácia:
 - dni: pondelok, utorok, streda, stvrtok, piatok, sobota, nedela
 - čas vždy HH:MM, ak sa dá; "o šiestej večer" je 18:00
 - "ráno" bez konkrétnej hodiny znamená time=null
-- beh/behať je workout_type="beh"
-- posilka/fitness je workout_type="posilka"
-- domáci tréning je workout_type="domaci_trening"
+- názov aktivity zachovaj podľa dynamického katalógu z kontextu
 - pri výsledku zachovaj užitočné údaje v result_text, napr. "5.2 km za 32 min"
 - na vyriešenie odkazov vždy použi KONTEXT Z DATABÁZY:
-  - "sobotný beh" je beh v sobotu
+  - opis aktivity a dňa porovnaj s dynamickým plánom v kontexte
   - "dnešný tréning" je tréning označený DNES
   - "zajtrajší tréning" je tréning označený ZAJTRA
-  - "posilka vo štvrtok" je posilka v deň stvrtok
   - "to, čo som chcel predtým" odkazuje na poslednú relevantnú predchádzajúcu správu
 - ak aktuálna správa doplní plan_id a odkazuje na predchádzajúcu požiadavku,
   spoj plan_id s intentom, dňom, časom alebo výsledkom z poslednej relevantnej správy

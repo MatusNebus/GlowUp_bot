@@ -24,6 +24,7 @@ from app.services.coach_responder import (
     respond_success,
     respond_unknown,
 )
+from app.services.capabilities_service import get_help
 from app.services.commitments_service import list_commitments
 from app.services.commitment_change_service import (
     list_changes,
@@ -434,15 +435,6 @@ def _request_or_set_commitment(
     return request_commitment_change(discord_user_id, workout_type, count_per_week)
 
 
-APP_HELP_TEXT = (
-    "Začni cez `jonas onboarding start`. Potom si nastavíš záväzky, v nedeľu ich "
-    "rozložíš do kalendára cez plánovanie a po tréningu zapíšeš výsledok cez "
-    "`jonas done <číslo> <výsledok>`. Žolík posunie jeden tréning najviac o deň, "
-    "štatistiky ukáže `jonas stats`. Prechádzka je bonus alebo regenerácia, "
-    "nikdy náhrada povinného tréningu."
-)
-
-
 async def _execute_ai_intent(message: discord.Message, parsed: dict) -> bool:
     discord_user_id = str(message.author.id)
     intent = parsed["intent"]
@@ -748,28 +740,7 @@ async def on_message(message: discord.Message) -> None:
         return
 
     if normalized_command == "help":
-        await message.channel.send(
-            "Príkazy: jonas help, jonas ping, jonas register Matúš, "
-            "jonas register Ema, jonas users, jonas commitment beh 2, "
-            "jonas commitments, jonas commitments all, jonas changes, "
-            "jonas approve change 1, jonas reject change 1, "
-            "jonas replacement request 1 posilka utorok 18:00 hala je zatvorená, "
-            "jonas approve replacement 1, jonas reject replacement 1, jonas replacements, "
-            "jonas plan beh piatok 18:00, jonas my week, jonas week, "
-            "jonas planning status, jonas done 3 5.2 32, "
-            "jonas done 4 drepy 3x12; kliky 3x8, jonas short 3 3.0 20, "
-            "jonas missed 3, jonas workout 3, jonas joker 3 sobota 10:00, "
-            "jonas joker status, jonas stats, jonas stats 2026-06, "
-            "jonas stats all, jonas report all, jonas test scheduler. "
-            "Onboarding: jonas onboarding start, jonas onboarding status, "
-            "jonas onboarding confirm. Debug: jonas pending, "
-            "jonas agent test <text>, jonas tool test <tool> <json>. "
-            "Automatické správy: nedeľa 19:00 plánovanie, denne 06:00 ranný plán, "
-            "denne 20:00 príprava na zajtra, po tréningu kontrola. "
-            "Prirodzený jazyk: jonas v piatok o 18:00 beh; "
-            "jonas tréning 3 hotový, 5.2 km za 32 min; "
-            "jonas posuň tréning 4 na sobotu 10:00; jonas ukáž štatistiky."
-        )
+        await message.channel.send(get_help())
         return
 
     if normalized_command == "ping":

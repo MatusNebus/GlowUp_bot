@@ -2,268 +2,191 @@ import re
 from datetime import datetime, timezone
 
 from app.database import get_connection
-from app.services.planning_service import get_plan_reference, is_forbidden_walk_type
+from app.services.activity_service import get_activity_fields
+from app.services.planning_service import get_plan_reference
 
 
-RUN_RESULT_FORMAT_MESSAGE = "Pri behu napíš výsledok napríklad: jonas done 3 5.2 32"
-EDIT_NOT_READY_MESSAGE = (
-    "Tento tréning už je zapísaný. Editáciu výsledkov doplníme neskôr."
-)
-MISSED_MESSAGE = (
-    "Tréning je zapísaný ako vynechaný. Toto nebolo zlyhanie systému, "
-    "toto bolo rozhodnutie. Jeden výpadok nie je koniec sveta, "
-    "ale opakovanie z toho spraví zvyk."
-)
+EDITABLE_STATUSES = {"planned", "postponed", "unanswered"}
 
 
-def complete_workout(
-    discord_user_id: str, plan_id: int, result_text: str
-) -> tuple[bool, str]:
-    """Označí plánovaný tréning ako splnený a uloží výsledok."""
-    return _log_workout(discord_user_id, plan_id, "completed", result_text)
+def complete_workout(discord_user_id: str, plan_id: int, result) -> tuple[bool, str]:
+    return _log_workout(discord_user_id, plan_id, "completed", result)
 
 
-def shorten_workout(
-    discord_user_id: str, plan_id: int, result_text: str
-) -> tuple[bool, str]:
-    """Označí plánovaný tréning ako skrátený a uloží výsledok."""
-    return _log_workout(discord_user_id, plan_id, "shortened", result_text)
+def shorten_workout(discord_user_id: str, plan_id: int, result) -> tuple[bool, str]:
+    return _log_workout(discord_user_id, plan_id, "shortened", result)
 
 
 def miss_workout(discord_user_id: str, plan_id: int) -> tuple[bool, str]:
-    """Označí plánovaný tréning ako vynechaný."""
     with get_connection() as connection:
         plan = _get_owned_plan(connection, discord_user_id, plan_id)
         if isinstance(plan, str):
             return False, plan
-
-        if plan["status"] not in {"planned", "postponed", "unanswered"}:
-            return False, EDIT_NOT_READY_MESSAGE
-
-        created_at = datetime.now(timezone.utc).isoformat()
+        if plan["status"] not in EDITABLE_STATUSES:
+            return False, "Tento tréning už nemožno upraviť."
+        now = datetime.now(timezone.utc).isoformat()
         connection.execute(
-            """
-            UPDATE weekly_plans
-            SET status = ?, completed_at = ?
-            WHERE id = ?
-            """,
-            ("missed", created_at, plan_id),
+            "UPDATE weekly_plans SET status = 'missed', completed_at = ? WHERE id = ?",
+            (now, plan_id),
         )
         connection.execute(
             """
             INSERT INTO workout_logs (
-                weekly_plan_id,
-                user_id,
-                workout_type,
-                status,
-                created_at
-            )
-            VALUES (?, ?, ?, ?, ?)
+                weekly_plan_id, user_id, activity_version_id, status, created_at
+            ) VALUES (?, ?, ?, 'missed', ?)
             """,
-            (plan["id"], plan["user_id"], plan["workout_type"], "missed", created_at),
+            (plan_id, plan["user_id"], plan["activity_version_id"], now),
         )
-
-    return True, MISSED_MESSAGE
+    return True, "Tréning je zapísaný ako vynechaný."
 
 
 def get_workout_detail(discord_user_id: str, plan_id: int) -> tuple[bool, str]:
-    """Vypíše detail tréningu a jeho výsledok, ak existuje."""
     with get_connection() as connection:
         plan = _get_owned_plan(connection, discord_user_id, plan_id)
         if isinstance(plan, str):
             return False, plan
-
         log = connection.execute(
-            """
-            SELECT *
-            FROM workout_logs
-            WHERE weekly_plan_id = ?
-            """,
-            (plan_id,),
+            "SELECT * FROM workout_logs WHERE weekly_plan_id = ?", (plan_id,)
         ).fetchone()
-
-    plan_ref = get_plan_reference(discord_user_id, plan["id"])
+        values = []
+        if log:
+            values = connection.execute(
+                """
+                SELECT f.display_name, f.unit, f.field_type, v.value_text, v.value_number
+                FROM workout_log_values v
+                JOIN activity_fields f ON f.id = v.activity_field_id
+                WHERE v.workout_log_id = ?
+                ORDER BY f.position
+                """,
+                (log["id"],),
+            ).fetchall()
+    ref = get_plan_reference(discord_user_id, plan_id)
     lines = [
-        f"Tréning [{plan_ref}]",
-        f"{plan['planned_day']} {plan['planned_time']} — {plan['workout_type']} — {plan['status']}",
+        f"Tréning [{ref}]",
+        f"{plan['planned_day']} {plan['planned_time']} - {plan['workout_type']} - {plan['status']}",
     ]
-
     if log is None:
         lines.append("Výsledok ešte nie je zapísaný.")
-        return True, "\n".join(lines)
-
-    lines.append(f"Zápis: {log['status']}")
-    if log["distance_km"] is not None and log["duration_minutes"] is not None:
-        lines.append(f"Beh: {log['distance_km']} km za {log['duration_minutes']} min")
-    if log["exercises_text"]:
-        lines.append(f"Cviky: {log['exercises_text']}")
-    if log["exercise_count"] is not None:
-        lines.append(f"Počet cvikov: {log['exercise_count']}")
-    if log["set_count"] is not None:
-        lines.append(f"Počet sérií: {log['set_count']}")
-    if log["note"]:
-        lines.append(f"Poznámka: {log['note']}")
-
+    else:
+        lines.append(f"Zápis: {log['status']}")
+        for value in values:
+            shown = (
+                value["value_text"]
+                if value["field_type"] == "text"
+                else _format_number(value["value_number"])
+            )
+            unit = f" {value['unit']}" if value["unit"] else ""
+            lines.append(f"{value['display_name']}: {shown}{unit}")
     return True, "\n".join(lines)
 
 
-def _log_workout(
-    discord_user_id: str, plan_id: int, status: str, result_text: str
-) -> tuple[bool, str]:
-    clean_result = result_text.strip()
-    if not clean_result:
-        return False, _result_format_message(status)
-
+def _log_workout(discord_user_id: str, plan_id: int, status: str, result) -> tuple[bool, str]:
     with get_connection() as connection:
         plan = _get_owned_plan(connection, discord_user_id, plan_id)
         if isinstance(plan, str):
             return False, plan
-
-        if plan["status"] not in {"planned", "postponed", "unanswered"}:
-            return False, EDIT_NOT_READY_MESSAGE
-
-        if is_forbidden_walk_type(plan["workout_type"]):
-            return False, "Prechádzka sa nikdy neráta ako tréning."
-
-        log_values = _build_log_values(plan["workout_type"], status, clean_result)
-        if isinstance(log_values, str):
-            return False, log_values
-
-        created_at = datetime.now(timezone.utc).isoformat()
+        if plan["status"] not in EDITABLE_STATUSES:
+            return False, "Tento tréning už nemožno upraviť."
+        fields = get_activity_fields(plan["activity_version_id"], connection)
+        parsed, errors = _parse_values(result, fields)
+        if errors:
+            return False, "Potrebujem všetky výsledky: " + "; ".join(errors)
+        now = datetime.now(timezone.utc).isoformat()
         connection.execute(
-            """
-            UPDATE weekly_plans
-            SET status = ?, completed_at = ?
-            WHERE id = ?
-            """,
-            (status, created_at, plan_id),
+            "UPDATE weekly_plans SET status = ?, completed_at = ? WHERE id = ?",
+            (status, now, plan_id),
         )
-        connection.execute(
+        cursor = connection.execute(
             """
             INSERT INTO workout_logs (
-                weekly_plan_id,
-                user_id,
-                workout_type,
-                status,
-                distance_km,
-                duration_minutes,
-                exercises_text,
-                exercise_count,
-                set_count,
-                note,
-                created_at
-            )
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                weekly_plan_id, user_id, activity_version_id, status, created_at
+            ) VALUES (?, ?, ?, ?, ?)
             """,
-            (
-                plan["id"],
-                plan["user_id"],
-                plan["workout_type"],
-                status,
-                log_values["distance_km"],
-                log_values["duration_minutes"],
-                log_values["exercises_text"],
-                log_values["exercise_count"],
-                log_values["set_count"],
-                log_values["note"],
-                created_at,
-            ),
+            (plan_id, plan["user_id"], plan["activity_version_id"], status, now),
         )
-
-    if status == "shortened":
-        return (
-            True,
-            "Skrátená verzia je zapísaná. Nebol to plný plán, ale stále si prišiel a odmakal časť.",
-        )
-
-    return True, "Tréning je zapísaný ako splnený. Dobrá práca, žiadne výhovorky."
-
-
-def _build_log_values(workout_type: str, status: str, result_text: str):
-    values = {
-        "distance_km": None,
-        "duration_minutes": None,
-        "exercises_text": None,
-        "exercise_count": None,
-        "set_count": None,
-        "note": None,
-    }
-
-    if workout_type == "beh":
-        run_result = _parse_run_result(result_text)
-        if run_result is None:
-            return RUN_RESULT_FORMAT_MESSAGE
-        values["distance_km"], values["duration_minutes"] = run_result
-        return values
-
-    if workout_type in {"posilka", "domaci_trening"}:
-        values["exercises_text"] = result_text
-        values["exercise_count"] = _count_exercises(result_text)
-        values["set_count"] = _count_sets(result_text)
-        return values
-
-    values["note"] = result_text
-    return values
+        for field, value_text, value_number in parsed:
+            connection.execute(
+                """
+                INSERT INTO workout_log_values (
+                    workout_log_id, activity_field_id, value_text, value_number
+                ) VALUES (?, ?, ?, ?)
+                """,
+                (cursor.lastrowid, field["id"], value_text, value_number),
+            )
+    message = "Skrátený tréning aj výsledky sú zapísané." if status == "shortened" else "Tréning aj všetky výsledky sú zapísané."
+    return True, message
 
 
-def _parse_run_result(result_text: str) -> tuple[float, float] | None:
-    normalized_text = result_text.replace(",", ".")
-    numbers = re.findall(r"\d+(?:\.\d+)?", normalized_text)
-    if len(numbers) < 2:
-        return None
+def _parse_values(result, fields):
+    provided = {}
+    if isinstance(result, list):
+        provided = {
+            str(item.get("field_key", "")).casefold(): item.get("value")
+            for item in result
+            if isinstance(item, dict)
+        }
+    elif isinstance(result, dict):
+        provided = {str(key).casefold(): value for key, value in result.items()}
+    else:
+        text = str(result or "").strip()
+        if len(fields) == 1:
+            provided[fields[0]["field_key"]] = text
+        else:
+            labelled = re.findall(r"([^,;:]+)\s*:\s*([^,;]+)", text)
+            provided = {key.strip().casefold(): value.strip() for key, value in labelled}
+            if not provided:
+                parts = [part.strip() for part in re.split(r"[;,]", text) if part.strip()]
+                if len(parts) == len(fields):
+                    provided = {field["field_key"]: part for field, part in zip(fields, parts)}
 
-    distance_km = float(numbers[0])
-    duration_minutes = float(numbers[1])
-    if distance_km <= 0 or duration_minutes <= 0:
-        return None
+    parsed, errors = [], []
+    for field in fields:
+        raw = provided.get(field["field_key"])
+        if raw is None:
+            raw = provided.get(field["display_name"].casefold())
+        if raw is None or str(raw).strip() == "":
+            errors.append(field["display_name"])
+            continue
+        value_text, value_number, error = _coerce_value(raw, field["field_type"])
+        if error:
+            errors.append(f"{field['display_name']} ({error})")
+        else:
+            parsed.append((field, value_text, value_number))
+    return parsed, errors
 
-    return distance_km, duration_minutes
 
-
-def _count_exercises(result_text: str) -> int | None:
-    exercises = [part.strip() for part in result_text.split(";") if part.strip()]
-    if not exercises:
-        return None
-    return len(exercises)
-
-
-def _count_sets(result_text: str) -> int | None:
-    set_counts = re.findall(r"(\d+)\s*[x×]\s*\d+", result_text.casefold())
-    if not set_counts:
-        return None
-    return sum(int(count) for count in set_counts)
+def _coerce_value(raw, field_type):
+    text = str(raw).strip()
+    if field_type == "text":
+        return text, None, None
+    numbers = re.findall(r"-?\d+(?:[.,]\d+)?", text)
+    if not numbers:
+        return None, None, "musí byť číslo"
+    number = float(numbers[0].replace(",", "."))
+    if field_type == "rating" and not 1 <= number <= 10:
+        return None, None, "hodnotenie musí byť 1 až 10"
+    if field_type in {"number", "duration"} and number < 0:
+        return None, None, "hodnota nemôže byť záporná"
+    return None, number, None
 
 
 def _get_owned_plan(connection, discord_user_id: str, plan_id: int):
     plan = connection.execute(
         """
-        SELECT
-            weekly_plans.id,
-            weekly_plans.user_id,
-            weekly_plans.week_start,
-            weekly_plans.workout_type,
-            weekly_plans.planned_day,
-            weekly_plans.planned_time,
-            weekly_plans.status,
-            users.discord_user_id,
-            users.display_name
-        FROM weekly_plans
-        JOIN users ON users.id = weekly_plans.user_id
-        WHERE weekly_plans.id = ?
+        SELECT p.*, u.discord_user_id
+        FROM weekly_plans p JOIN users u ON u.id = p.user_id
+        WHERE p.id = ?
         """,
         (plan_id,),
     ).fetchone()
-
     if plan is None:
-        return "Takýto tréning v pláne neexistuje."
-
+        return "Takýto tréning neexistuje."
     if plan["discord_user_id"] != discord_user_id:
-        return "Tento tréning nepatrí tebe, takže ho nemôžeš upraviť."
-
+        return "Tento tréning nepatrí tebe."
     return plan
 
 
-def _result_format_message(status: str) -> str:
-    if status == "shortened":
-        return "Pri skrátenom tréningu napíš výsledok napríklad: jonas short 3 3.0 20"
-    return "Pri zápise tréningu napíš výsledok napríklad: jonas done 3 5.2 32"
+def _format_number(value) -> str:
+    if value is None:
+        return ""
+    return str(int(value)) if float(value).is_integer() else f"{value:.2f}".rstrip("0")
