@@ -1,5 +1,5 @@
 import unicodedata
-from datetime import datetime, timezone
+from datetime import date, datetime, timedelta, timezone
 
 from app.database import get_connection
 from app.services.pending_actions_service import create_pending_action
@@ -72,6 +72,11 @@ def request_workout_replacement(
             return False, f"Pre tento tréning už existuje otvorená náhrada #{existing['id']}."
 
         now = datetime.now(timezone.utc).isoformat()
+        replacement_week_start = plan["week_start"]
+        if plan["planned_day"] == "nedela" and request["replacement_day"] == "pondelok":
+            replacement_week_start = (
+                date.fromisoformat(plan["week_start"]) + timedelta(days=7)
+            ).isoformat()
         cursor = connection.execute(
             """
             INSERT INTO workout_replacement_requests (
@@ -112,7 +117,7 @@ def request_workout_replacement(
         f"Návrh náhrady tréningu #{request_id}: {user['display_name']} chce nahradiť "
         f"{plan['workout_type']} v {plan['planned_day']} {plan['planned_time']} za "
         f"{replacement_activity['display_name']} v {normalized_day} {replacement_time}. Dôvod: {reason.strip()}. "
-        "Zmena prejde až po súhlase všetkých aktívnych používateľov.\n"
+        f"Zmena prejde až po jednomyseľnom súhlase. Hlasujú: {_pending_mentions(request_id)}.\n"
         f"Schválenie: jonas approve replacement {request_id}\n"
         f"Odmietnutie: jonas reject replacement {request_id}",
     )
@@ -324,7 +329,7 @@ def _apply_if_unanimous(request_id: int) -> tuple[bool, str]:
             (
                 plan["user_id"],
                 request["replacement_activity_version_id"],
-                plan["week_start"],
+                replacement_week_start,
                 request["replacement_workout_type"],
                 request["replacement_day"],
                 request["replacement_time"],
@@ -361,3 +366,22 @@ def _owned_plan(connection, discord_user_id: str, plan_id: int):
 def _normalize(text: str) -> str:
     decomposed = unicodedata.normalize("NFKD", str(text).casefold())
     return "".join(char for char in decomposed if not unicodedata.combining(char))
+
+
+def _pending_mentions(request_id: int) -> str:
+    with get_connection() as connection:
+        rows = connection.execute(
+            """
+            SELECT users.discord_user_id
+            FROM users
+            WHERE users.is_active = 1
+              AND NOT EXISTS (
+                  SELECT 1 FROM workout_replacement_votes votes
+                  WHERE votes.request_id = ?
+                    AND votes.voter_discord_user_id = users.discord_user_id
+              )
+            ORDER BY users.id
+            """,
+            (request_id,),
+        ).fetchall()
+    return " ".join(f"<@{row['discord_user_id']}>" for row in rows) or "nikto"

@@ -5,7 +5,7 @@ from pathlib import Path
 BASE_DIR = Path(__file__).resolve().parent.parent
 DATA_DIR = BASE_DIR / "data"
 DB_PATH = DATA_DIR / "couple_glowup.db"
-SCHEMA_VERSION = 2
+SCHEMA_VERSION = 3
 
 
 class ClosingConnection(sqlite3.Connection):
@@ -26,13 +26,27 @@ def get_connection() -> sqlite3.Connection:
 
 
 def init_database() -> None:
-    """Create the current schema and perform the one-time clean v2 migration."""
+    """Create or extend the current schema without deleting existing data."""
     with get_connection() as connection:
         _create_preserved_tables(connection)
-        version = connection.execute("PRAGMA user_version").fetchone()[0]
-        if version < SCHEMA_VERSION:
-            _migrate_to_dynamic_activities(connection)
+        _preserve_incompatible_dynamic_tables(connection)
         _create_dynamic_tables(connection)
+        _ensure_column(
+            connection, "users", "onboarding_state", "TEXT NOT NULL DEFAULT 'needs_commitments'"
+        )
+        _ensure_column(connection, "users", "last_commitment_reminder_at", "TEXT")
+        connection.execute(
+            """
+            UPDATE users
+            SET onboarding_state = CASE
+                WHEN EXISTS (
+                    SELECT 1 FROM commitments
+                    WHERE commitments.user_id = users.id AND commitments.is_active = 1
+                ) THEN 'complete'
+                ELSE 'needs_commitments'
+            END
+            """
+        )
         connection.execute(f"PRAGMA user_version = {SCHEMA_VERSION}")
 
 
@@ -72,32 +86,6 @@ def _create_preserved_tables(connection: sqlite3.Connection) -> None:
     )
     _ensure_column(connection, "message_memory", "author_display_name", "TEXT")
     _ensure_column(connection, "message_memory", "channel_id", "TEXT")
-
-
-def _migrate_to_dynamic_activities(connection: sqlite3.Connection) -> None:
-    """Deliberately clear old training data before installing the dynamic model."""
-    connection.execute("PRAGMA foreign_keys = OFF")
-    for table in (
-        "workout_log_values",
-        "workout_logs",
-        "jokers",
-        "workout_replacement_votes",
-        "workout_replacement_requests",
-        "commitment_change_votes",
-        "commitment_change_requests",
-        "activity_change_requests",
-        "weekly_plans",
-        "commitments",
-        "activity_fields",
-        "activity_versions",
-        "activity_types",
-        "approved_activity_types",
-        "onboarding_sessions",
-        "pending_actions",
-        "notification_log",
-    ):
-        connection.execute(f"DROP TABLE IF EXISTS {table}")
-    connection.execute("PRAGMA foreign_keys = ON")
 
 
 def _create_dynamic_tables(connection: sqlite3.Connection) -> None:
@@ -291,6 +279,32 @@ def _create_dynamic_tables(connection: sqlite3.Connection) -> None:
         );
         """
     )
+
+
+def _preserve_incompatible_dynamic_tables(connection: sqlite3.Connection) -> None:
+    """Move legacy tables aside when their shape cannot support the current services."""
+    required_columns = {
+        "activity_types": {"id", "slug", "current_version_id"},
+        "activity_versions": {"id", "activity_type_id", "display_name"},
+        "activity_fields": {"id", "activity_version_id", "field_key"},
+        "commitments": {"id", "user_id", "activity_type_id", "count_per_week"},
+        "weekly_plans": {"id", "user_id", "activity_version_id", "week_start", "status"},
+        "workout_logs": {"id", "weekly_plan_id", "activity_version_id"},
+        "workout_log_values": {"id", "workout_log_id", "activity_field_id"},
+    }
+    for table_name, required in required_columns.items():
+        columns = connection.execute(f"PRAGMA table_info({table_name})").fetchall()
+        if not columns or required.issubset({column["name"] for column in columns}):
+            continue
+        suffix = 1
+        backup_name = f"{table_name}_legacy_v{suffix}"
+        while connection.execute(
+            "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = ?",
+            (backup_name,),
+        ).fetchone():
+            suffix += 1
+            backup_name = f"{table_name}_legacy_v{suffix}"
+        connection.execute(f"ALTER TABLE {table_name} RENAME TO {backup_name}")
 
 
 def _ensure_column(

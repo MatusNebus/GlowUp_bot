@@ -1,4 +1,4 @@
-from datetime import datetime, timezone
+from datetime import date, datetime, timedelta, timezone
 
 from app.database import get_connection
 from app.services.planning_service import (
@@ -18,9 +18,6 @@ JOKER_USED_MESSAGE = (
     "Žolíka si už tento týždeň použil/a. Ďalší odklad nie je povolený."
 )
 JOKER_TOO_FAR_MESSAGE = "Žolík môže posunúť tréning maximálne o jeden deň."
-SUNDAY_MESSAGE = (
-    "Nedeľný tréning sa žolíkom v MVP zatiaľ nedá posunúť do ďalšieho týždňa."
-)
 LOCKED_STATUS_MESSAGE = (
     "Tento tréning už je completed, shortened alebo missed. Žolíkom sa už posunúť nedá."
 )
@@ -38,12 +35,10 @@ def use_joker(
     if not is_valid_time(new_time):
         return False, "Čas musí byť vo formáte HH:MM, napríklad 10:00."
 
-    current_week_start = get_current_week_start()
-
     with get_connection() as connection:
         user = _get_user(connection, discord_user_id)
         if user is None:
-            return False, "Najprv sa musíš registrovať. Skús: jonas register Matúš"
+            return False, "Používateľa sa nepodarilo automaticky zaregistrovať."
 
         plan = _get_plan(connection, plan_id)
         if plan is None:
@@ -61,7 +56,7 @@ def use_joker(
             FROM jokers
             WHERE user_id = ? AND week_start = ?
             """,
-            (user["id"], current_week_start),
+            (user["id"], plan["week_start"]),
         ).fetchone()
 
         if joker is not None:
@@ -72,12 +67,15 @@ def use_joker(
         if old_day_order is None or new_day_order is None:
             return False, "Tréning má neznámy deň v pláne. Skús ho naplánovať nanovo."
 
-        if plan["planned_day"] == "nedela" and normalized_day == "pondelok":
-            return False, SUNDAY_MESSAGE
-
-        day_shift = new_day_order - old_day_order
+        crosses_week = plan["planned_day"] == "nedela" and normalized_day == "pondelok"
+        day_shift = 1 if crosses_week else new_day_order - old_day_order
         if day_shift < 0 or day_shift > 1:
             return False, JOKER_TOO_FAR_MESSAGE
+        new_week_start = (
+            date.fromisoformat(plan["week_start"]) + timedelta(days=7)
+            if crosses_week
+            else date.fromisoformat(plan["week_start"])
+        ).isoformat()
 
         used_at = datetime.now(timezone.utc).isoformat()
         connection.execute(
@@ -96,7 +94,7 @@ def use_joker(
             """,
             (
                 user["id"],
-                current_week_start,
+                plan["week_start"],
                 plan["id"],
                 used_at,
                 plan["planned_day"],
@@ -108,13 +106,14 @@ def use_joker(
         connection.execute(
             """
             UPDATE weekly_plans
-            SET planned_day = ?,
+            SET week_start = ?,
+                planned_day = ?,
                 planned_time = ?,
                 status = 'postponed',
                 joker_used = 1
             WHERE id = ?
             """,
-            (normalized_day, new_time, plan["id"]),
+            (new_week_start, normalized_day, new_time, plan["id"]),
         )
 
     return (
@@ -132,7 +131,7 @@ def joker_status(discord_user_id: str) -> tuple[bool, str]:
     with get_connection() as connection:
         user = _get_user(connection, discord_user_id)
         if user is None:
-            return False, "Najprv sa musíš registrovať. Skús: jonas register Matúš"
+            return False, "Používateľa sa nepodarilo automaticky zaregistrovať."
 
         joker = connection.execute(
             """

@@ -1,6 +1,6 @@
 import re
 import unicodedata
-from datetime import date, datetime, timezone
+from datetime import date, datetime, timedelta, timezone
 
 from app.database import get_connection
 from app.services.activity_service import get_active_activity
@@ -37,6 +37,20 @@ def get_current_week_start() -> str:
     return monday.isoformat()
 
 
+def get_week_start(target_week: str | None = None) -> str:
+    current = date.fromisoformat(get_current_week_start())
+    normalized = (target_week or "current_week").strip().casefold()
+    if normalized in {"current", "current_week", "tento", "tento_tyždeň", "tento_tyzdnen"}:
+        return current.isoformat()
+    if normalized in {"next", "next_week", "budúci", "buduci", "ďalší", "dalsi"}:
+        return (current + timedelta(days=7)).isoformat()
+    try:
+        requested = date.fromisoformat(normalized)
+    except ValueError as error:
+        raise ValueError("Cieľový týždeň musí byť current_week, next_week alebo dátum.") from error
+    return (requested - timedelta(days=requested.weekday())).isoformat()
+
+
 def normalize_day(day_text: str) -> str:
     """Normalizuje slovenský deň na lowercase bez diakritiky."""
     normalized = _strip_accents(day_text.strip().casefold())
@@ -46,7 +60,11 @@ def normalize_day(day_text: str) -> str:
 
 
 def add_plan(
-    discord_user_id: str, workout_type: str, planned_day: str, planned_time: str
+    discord_user_id: str,
+    workout_type: str,
+    planned_day: str,
+    planned_time: str,
+    target_week: str | None = None,
 ) -> tuple[bool, str]:
     """Pridá tréning do aktuálneho týždenného plánu podľa existujúceho záväzku."""
     if not workout_type.strip():
@@ -60,12 +78,15 @@ def add_plan(
     if not is_valid_time(planned_time):
         return False, "Čas musí byť vo formáte HH:MM, napríklad 18:00."
 
-    week_start = get_current_week_start()
+    try:
+        week_start = get_week_start(target_week)
+    except ValueError as error:
+        return False, str(error)
 
     with get_connection() as connection:
         user = _get_user(connection, discord_user_id)
         if user is None:
-            return False, "Najprv sa musíš registrovať. Skús: jonas register Matúš"
+            return False, "Používateľa sa nepodarilo automaticky zaregistrovať."
 
         activity = get_active_activity(workout_type, connection)
         if activity is None:
@@ -141,19 +162,22 @@ def add_plan(
     )
 
 
-def list_my_week(discord_user_id: str) -> tuple[bool, str]:
+def list_my_week(discord_user_id: str, target_week: str | None = None) -> tuple[bool, str]:
     """Vypíše plán autora správy na aktuálny týždeň."""
+    week_start = get_week_start(target_week)
     with get_connection() as connection:
         user = _get_user(connection, discord_user_id)
         if user is None:
-            return False, "Najprv sa musíš registrovať. Skús: jonas register Matúš"
+            return False, "Používateľa sa nepodarilo automaticky zaregistrovať."
 
-        plans = _fetch_week_plans(connection, user["id"])
+        plans = _fetch_week_plans(connection, user["id"], week_start)
 
     if not plans:
-        return True, f"{user['display_name']} zatiaľ nemá plán na aktuálny týždeň."
+        return True, f"{user['display_name']} zatiaľ nemá plán na týždeň od {week_start}."
 
-    return True, _format_week_plans(plans, f"Plán pre {user['display_name']}:", False)
+    return True, _format_week_plans(
+        plans, f"Plán pre {user['display_name']} na týždeň od {week_start}:", False
+    )
 
 
 def list_all_week() -> str:
@@ -167,14 +191,14 @@ def list_all_week() -> str:
     return _format_week_plans(plans, "Týždenný plán:", True)
 
 
-def weekly_status(discord_user_id: str) -> tuple[bool, str]:
+def weekly_status(discord_user_id: str, target_week: str | None = None) -> tuple[bool, str]:
     """Porovná záväzky používateľa s naplánovanými tréningmi v aktuálnom týždni."""
-    week_start = get_current_week_start()
+    week_start = get_week_start(target_week)
 
     with get_connection() as connection:
         user = _get_user(connection, discord_user_id)
         if user is None:
-            return False, "Najprv sa musíš registrovať. Skús: jonas register Matúš"
+            return False, "Používateľa sa nepodarilo automaticky zaregistrovať."
 
         commitments = connection.execute(
             """
@@ -223,6 +247,20 @@ def weekly_status(discord_user_id: str) -> tuple[bool, str]:
     return True, "\n".join(lines)
 
 
+def start_week_planning(
+    discord_user_id: str, target_week: str | None = None
+) -> tuple[bool, str]:
+    """Return the exact commitments still needing calendar slots for a target week."""
+    week_start = get_week_start(target_week)
+    success, status = weekly_status(discord_user_id, week_start)
+    if not success:
+        return success, status
+    return True, (
+        f"Plánujeme týždeň od {week_start}. {status}\n"
+        "Pošli mi postupne aktivitu, deň a čas pre každý chýbajúci tréning."
+    )
+
+
 def _strip_accents(text: str) -> str:
     decomposed = unicodedata.normalize("NFKD", text)
     return "".join(char for char in decomposed if not unicodedata.combining(char))
@@ -251,8 +289,8 @@ def _get_user(connection, discord_user_id: str):
     ).fetchone()
 
 
-def _fetch_week_plans(connection, user_id: int | None = None):
-    week_start = get_current_week_start()
+def _fetch_week_plans(connection, user_id: int | None = None, week_start: str | None = None):
+    week_start = week_start or get_current_week_start()
     user_filter = ""
     parameters: list[object] = [week_start]
 
@@ -340,7 +378,11 @@ def get_plan_reference(discord_user_id: str, plan_id: int) -> int:
 
 
 def _get_plan_reference(connection, user_id: int, plan_id: int) -> int:
-    plans = _fetch_week_plans(connection, user_id)
+    row = connection.execute(
+        "SELECT week_start FROM weekly_plans WHERE id = ? AND user_id = ?",
+        (plan_id, user_id),
+    ).fetchone()
+    plans = _fetch_week_plans(connection, user_id, row["week_start"] if row else None)
     for index, plan in enumerate(plans, start=1):
         if plan["id"] == plan_id:
             return index

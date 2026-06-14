@@ -4,223 +4,248 @@ from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 from app.config import BOT_TIMEZONE, DISCORD_CHANNEL_ID
 from app.database import get_connection
-from app.services.coach_responder import generate_final_reply
 from app.services.activity_service import format_result_prompt
+from app.services.coach_responder import generate_final_reply
+from app.services.joker_service import use_joker
 from app.services.planning_service import DAY_ORDER
+from app.services.workout_service import miss_workout
 
 
 _scheduler_task: asyncio.Task | None = None
 
 
 def start_scheduler(client) -> asyncio.Task | None:
-    """Spustí scheduler iba raz, aj keď sa Discord klient znovu pripojí."""
     global _scheduler_task
-
     if not DISCORD_CHANNEL_ID:
-        print("Scheduler sa nespustil: chýba DISCORD_CHANNEL_ID v súbore .env.")
+        print("Scheduler sa nespustil: chýba DISCORD_CHANNEL_ID.")
         return None
-
-    if _scheduler_task is not None and not _scheduler_task.done():
-        return _scheduler_task
-
     try:
         int(DISCORD_CHANNEL_ID)
     except ValueError:
         print("Scheduler sa nespustil: DISCORD_CHANNEL_ID musí byť číslo.")
         return None
-
-    _scheduler_task = asyncio.create_task(scheduler_loop(client))
-    print(f"Scheduler spustený pre kanál {DISCORD_CHANNEL_ID}")
+    if _scheduler_task is None or _scheduler_task.done():
+        _scheduler_task = asyncio.create_task(scheduler_loop(client))
     return _scheduler_task
 
 
 async def scheduler_loop(client) -> None:
-    """Každú minútu skontroluje, či treba poslať automatickú správu."""
-    bot_timezone = get_bot_timezone()
-
     while not client.is_closed():
-        now = datetime.now(bot_timezone)
+        now = datetime.now(get_bot_timezone())
         try:
+            if now.minute in {0, 30}:
+                await send_commitment_reminders(client, now)
             if now.weekday() == 6 and now.hour == 19 and now.minute == 0:
                 await send_sunday_planning_message(client, now)
             if now.hour == 6 and now.minute == 0:
                 await send_daily_morning_message(client, now)
-            if now.hour == 20 and now.minute == 0:
+            if now.hour == 21 and now.minute == 0:
                 await send_evening_preparation_message(client, now)
             await send_workout_upcoming_reminders(client, now)
-            if 6 <= now.hour < 22 and now.minute == 0:
-                await send_post_workout_checks(client, now)
+            await send_post_workout_checks(client, now)
             if now.hour == 5 and now.minute == 59:
                 await send_unanswered_reminders(client, now)
+            if now.hour == 12 and now.minute == 0:
+                await resolve_unanswered_workouts(client, now)
         except Exception as error:
             print(f"Scheduler chyba: {error}")
-
         await asyncio.sleep(60)
 
 
-async def send_sunday_planning_message(client, now: datetime) -> None:
-    key = f"sunday_planning_{now.date().isoformat()}"
-    if was_notification_sent(key):
+async def send_commitment_reminders(client, now: datetime) -> None:
+    if not 6 <= now.hour < 22:
         return
-    await _send_once(client, key, _build_sunday_planning_message())
+    for user in _users_missing_commitments(now):
+        key = f"commitments_missing:{user['discord_user_id']}:{now:%Y-%m-%d-%H}"
+        facts = (
+            f"<@{user['discord_user_id']}> ešte nemáš weekly commitments. "
+            "Napíš mi aktivity a počet opakovaní za týždeň, aby sme mohli plánovať."
+        )
+        if await _send_facts_once(client, key, facts, "coach"):
+            with get_connection() as connection:
+                connection.execute(
+                    "UPDATE users SET last_commitment_reminder_at = ? WHERE id = ?",
+                    (now.astimezone(timezone.utc).isoformat(), user["id"]),
+                )
+
+
+async def send_sunday_planning_message(client, now: datetime) -> None:
+    next_week = (now.date() + timedelta(days=7 - now.weekday())).isoformat()
+    with get_connection() as connection:
+        users = connection.execute(
+            """
+            SELECT users.discord_user_id, users.display_name,
+                   GROUP_CONCAT(commitments.workout_type || ' ' ||
+                                commitments.count_per_week || 'x', ', ') AS summary
+            FROM users
+            JOIN commitments ON commitments.user_id = users.id AND commitments.is_active = 1
+            WHERE users.is_active = 1
+            GROUP BY users.id
+            ORDER BY users.id
+            """
+        ).fetchall()
+    if not users:
+        return
+    facts = (
+        "Nedeľná výzva na plánovanie budúceho týždňa od "
+        f"{next_week}. "
+        + "; ".join(
+            f"<@{user['discord_user_id']}>: {user['summary']}" for user in users
+        )
+    )
+    await _send_facts_once(client, f"sunday_planning:{now:%Y-%W}", facts, "coach")
 
 
 async def send_daily_morning_message(client, now: datetime) -> None:
-    key = f"morning_{now.date().isoformat()}"
-    if was_notification_sent(key):
-        return
-    await _send_once(client, key, _build_morning_message(now.date()))
+    for user_id, plans in _group_plans(get_plans_for_date(now.date())).items():
+        facts = _personal_plan_facts(user_id, plans, "Dnešné tréningy")
+        await _send_facts_once(
+            client, f"morning:{user_id}:{now:%Y-%m-%d}", facts, "coach"
+        )
 
 
 async def send_evening_preparation_message(client, now: datetime) -> None:
-    key = f"evening_prep_{now.date().isoformat()}"
-    if was_notification_sent(key):
-        return
-
-    message = _build_evening_message(now.date() + timedelta(days=1))
-    if message is not None:
-        await _send_once(client, key, message)
+    tomorrow = now.date() + timedelta(days=1)
+    for user_id, plans in _group_plans(get_plans_for_date(tomorrow)).items():
+        facts = _personal_plan_facts(user_id, plans, "Zajtrajšie tréningy")
+        await _send_facts_once(
+            client, f"evening:{user_id}:{tomorrow.isoformat()}", facts, "coach"
+        )
 
 
 async def send_workout_upcoming_reminders(client, now: datetime) -> None:
-    """Presne 15 minút pred začiatkom pripomenie naplánovaný tréning."""
-    channel = await get_channel(client)
-    if channel is None:
-        return
-
-    for plan in _get_plans_starting_in_15_minutes(now):
-        key = f"workout_upcoming_plan_{plan['id']}"
-        if was_notification_sent(key):
-            continue
-
-        factual_message = (
-            f"{plan['display_name']}, {_planned_workout_form(plan['display_name'])} "
-            f"{plan['workout_type']} o {plan['planned_time']}. "
-            "Začínaš o 15 minút, priprav sa."
+    for plan in _plans_starting_in_15_minutes(now):
+        facts = (
+            f"<@{plan['discord_user_id']}> má o 15 minút aktivitu "
+            f"{plan['workout_type']} o {plan['planned_time']}."
         )
-        await channel.send(await _scheduled_reply(factual_message, "strict"))
-        mark_notification_sent(key)
+        await _send_facts_once(client, f"preworkout:{plan['id']}", facts, "strict")
 
 
 async def send_post_workout_checks(client, now: datetime) -> None:
-    channel = await get_channel(client)
-    if channel is None:
+    if not 6 <= now.hour < 22:
         return
-
-    for plan in _get_plans_due_for_check(now):
-        key = f"post_check_plan_{plan['id']}"
-        if was_notification_sent(key):
-            continue
-
-        factual_message = (
-            f"{plan['display_name']}, {_had_workout_form(plan['display_name'])} tréning. "
-            f"Splnené? Zapíš naraz tieto povinné výsledky: "
-            f"{format_result_prompt(plan['activity_version_id'])}. "
-            f"Použi: jonas done {plan['plan_ref']} <výsledky>, "
-            f"alebo ak to nevyšlo: jonas missed {plan['plan_ref']}"
-        )
-        await channel.send(await _scheduled_reply(factual_message, "coach"))
-        with get_connection() as connection:
-            connection.execute(
-                """
-                UPDATE weekly_plans
-                SET status = 'unanswered'
-                WHERE id = ? AND status IN ('planned', 'postponed')
-                """,
-                (plan["id"],),
-            )
-        mark_notification_sent(key)
+    for plan in get_plans_for_date(now.date()):
+        elapsed = _elapsed_minutes(plan, now)
+        if plan["status"] in {"planned", "postponed"} and 120 <= elapsed < 180:
+            key = f"postworkout_initial:{plan['id']}"
+            if await _send_facts_once(client, key, _post_workout_facts(plan), "coach"):
+                with get_connection() as connection:
+                    connection.execute(
+                        """
+                        UPDATE weekly_plans SET status = 'unanswered'
+                        WHERE id = ? AND status IN ('planned', 'postponed')
+                        """,
+                        (plan["id"],),
+                    )
+        elif plan["status"] == "unanswered" and elapsed >= 180 and now.minute == 0:
+            key = f"postworkout_hourly:{plan['id']}:{now:%Y-%m-%d-%H}"
+            await _send_facts_once(client, key, _post_workout_facts(plan), "strict")
 
 
 async def send_unanswered_reminders(client, now: datetime) -> None:
-    channel = await get_channel(client)
-    if channel is None:
-        return
+    yesterday = now.date() - timedelta(days=1)
+    for plan in get_unanswered_from_previous_day(yesterday):
+        joker_available = _joker_available(plan["user_id"], plan["week_start"])
+        consequence = (
+            "Ak neodpovieš do 12:00, môže sa automaticky použiť tvoj žolík."
+            if joker_available
+            else "Ak neodpovieš do 12:00, tréning bude označený ako missed."
+        )
+        facts = (
+            f"<@{plan['discord_user_id']}> včera neodpovedal k aktivite "
+            f"{plan['workout_type']}. Naozaj si ju nesplnil/a? {consequence}"
+        )
+        await _send_facts_once(client, f"unanswered_0559:{plan['id']}", facts, "strict")
 
-    previous_day = now.date() - timedelta(days=1)
-    for plan in get_unanswered_from_previous_day(previous_day):
-        key = f"unanswered_reminder_plan_{plan['id']}_{now.date().isoformat()}"
+
+async def resolve_unanswered_workouts(client, now: datetime) -> None:
+    yesterday = now.date() - timedelta(days=1)
+    for plan in get_unanswered_from_previous_day(yesterday):
+        key = f"unanswered_1200:{plan['id']}"
         if was_notification_sent(key):
             continue
-
-        factual_message = (
-            f"{plan['display_name']}, včera zostal tréning nezodpovedaný. "
-            "Buď zapíš výsledok, alebo ho označ ako vynechaný. "
-            "Ticho nie je stratégia."
-        )
-        await channel.send(await _scheduled_reply(factual_message, "strict"))
-        mark_notification_sent(key)
+        success = False
+        result = ""
+        if _joker_available(plan["user_id"], plan["week_start"]):
+            fallback_time = "20:00"
+            if now.strftime("%H:%M") < fallback_time:
+                success, result = use_joker(
+                    plan["discord_user_id"], plan["id"], _day_name(now.date()), fallback_time
+                )
+        if not success:
+            success, result = miss_workout(plan["discord_user_id"], plan["id"])
+        facts = f"<@{plan['discord_user_id']}> {result}"
+        await _send_facts_once(client, key, facts, "strict")
 
 
 async def send_scheduler_test_messages(client) -> tuple[bool, str]:
-    """Pošle ukážky troch časovaných správ bez zápisu do notification_log."""
-    channel = await get_channel(client)
-    if channel is None:
-        return False, "Test schedulera zlyhal: nastavený Discord kanál nie je dostupný."
+    now = datetime.now(get_bot_timezone())
+    await send_commitment_reminders(client, now.replace(hour=8, minute=0))
+    await send_daily_morning_message(client, now.replace(hour=6, minute=0))
+    await send_evening_preparation_message(client, now.replace(hour=21, minute=0))
+    return True, "Scheduler test spustil commitment, rannú a večernú kontrolu."
 
-    bot_timezone = get_bot_timezone()
-    today = datetime.now(bot_timezone).date()
-    await channel.send("[TEST] " + _build_morning_message(today))
 
-    evening_message = _build_evening_message(today + timedelta(days=1))
-    if evening_message is None:
-        evening_message = (
-            "Zajtra máš tréning. Nachystaj si veci už večer. "
-            "Ráno nechceme debatný krúžok s lenivosťou. "
-            "(Testovacia ukážka, zajtra zatiaľ nie je tréning v pláne.)"
-        )
-    await channel.send("[TEST] " + evening_message)
-    await channel.send("[TEST] " + _build_sunday_planning_message())
+def get_plans_for_date(target_date: date) -> list[dict]:
+    with get_connection() as connection:
+        rows = connection.execute(
+            """
+            SELECT p.*, u.discord_user_id, u.display_name
+            FROM weekly_plans p
+            JOIN users u ON u.id = p.user_id
+            WHERE u.is_active = 1
+              AND p.status IN ('planned', 'postponed', 'unanswered')
+            ORDER BY p.planned_time, p.id
+            """
+        ).fetchall()
+    return [
+        dict(row)
+        for row in rows
+        if get_plan_date(row["week_start"], row["planned_day"]) == target_date
+    ]
 
-    return True, "Test schedulera odoslal rannú, večernú a nedeľnú ukážku."
+
+def get_unanswered_from_previous_day(target_date: date) -> list[dict]:
+    return [plan for plan in get_plans_for_date(target_date) if plan["status"] == "unanswered"]
+
+
+def get_plan_date(week_start: str, planned_day: str) -> date | None:
+    try:
+        return date.fromisoformat(week_start) + timedelta(days=DAY_ORDER[planned_day] - 1)
+    except (ValueError, KeyError):
+        return None
 
 
 def was_notification_sent(key: str) -> bool:
     with get_connection() as connection:
-        row = connection.execute(
-            "SELECT id FROM notification_log WHERE notification_key = ?",
-            (key,),
-        ).fetchone()
-    return row is not None
+        return connection.execute(
+            "SELECT 1 FROM notification_log WHERE notification_key = ?", (key,)
+        ).fetchone() is not None
 
 
 def mark_notification_sent(key: str) -> None:
     with get_connection() as connection:
         connection.execute(
-            """
-            INSERT OR IGNORE INTO notification_log (notification_key, sent_at)
-            VALUES (?, ?)
-            """,
+            "INSERT OR IGNORE INTO notification_log (notification_key, sent_at) VALUES (?, ?)",
             (key, datetime.now(timezone.utc).isoformat()),
         )
 
 
 def get_bot_timezone():
-    """Vráti nastavené pásmo alebo lokálny Windows čas ako praktický fallback."""
     try:
         return ZoneInfo(BOT_TIMEZONE)
     except ZoneInfoNotFoundError:
-        local_timezone = datetime.now().astimezone().tzinfo
-        print(
-            f"Časové pásmo {BOT_TIMEZONE} nie je dostupné. "
-            f"Scheduler používa lokálny čas počítača: {local_timezone}."
-        )
-        return local_timezone
+        return datetime.now().astimezone().tzinfo
 
 
 async def get_channel(client):
     if not DISCORD_CHANNEL_ID:
         return None
-
-    try:
-        channel_id = int(DISCORD_CHANNEL_ID)
-    except ValueError:
-        print("Scheduler nevie načítať kanál: DISCORD_CHANNEL_ID musí byť číslo.")
-        return None
+    channel_id = int(DISCORD_CHANNEL_ID)
     channel = client.get_channel(channel_id)
     if channel is not None:
         return channel
-
     try:
         return await client.fetch_channel(channel_id)
     except Exception as error:
@@ -228,229 +253,95 @@ async def get_channel(client):
         return None
 
 
-def list_active_users() -> list[dict]:
-    with get_connection() as connection:
-        rows = connection.execute(
-            """
-            SELECT id, display_name
-            FROM users
-            WHERE is_active = 1
-            ORDER BY display_name ASC
-            """
-        ).fetchall()
-    return [dict(row) for row in rows]
-
-
-def get_plans_for_date(target_date: date) -> list[dict]:
-    """Vráti aktívne tréningy naplánované na konkrétny dátum."""
-    with get_connection() as connection:
-        rows = connection.execute(
-            """
-            SELECT
-                weekly_plans.id,
-                weekly_plans.user_id,
-                weekly_plans.week_start,
-                weekly_plans.planned_day,
-                weekly_plans.planned_time,
-                weekly_plans.workout_type,
-                weekly_plans.activity_version_id,
-                weekly_plans.status,
-                users.display_name
-            FROM weekly_plans
-            JOIN users ON users.id = weekly_plans.user_id
-            WHERE users.is_active = 1
-              AND weekly_plans.status IN ('planned', 'postponed', 'unanswered')
-            ORDER BY weekly_plans.planned_time ASC
-            """
-        ).fetchall()
-
-    plans = []
-    for row in rows:
-        if get_plan_date(row["week_start"], row["planned_day"]) != target_date:
-            continue
-        plan = dict(row)
-        plan["plan_ref"] = _get_plan_reference(
-            plan["user_id"], plan["week_start"], plan["id"]
-        )
-        plans.append(plan)
-    return plans
-
-
-def get_unanswered_from_previous_day(target_date: date) -> list[dict]:
-    return [
-        plan
-        for plan in get_plans_for_date(target_date)
-        if plan["status"] == "unanswered"
-    ]
-
-
-def get_plan_date(week_start: str, planned_day: str) -> date | None:
-    """Určí dátum tréningu z pondelka týždňa a slovenského názvu dňa."""
-    day_number = DAY_ORDER.get(planned_day)
-    if day_number is None:
-        return None
-
-    try:
-        monday = date.fromisoformat(week_start)
-    except ValueError:
-        return None
-
-    return monday + timedelta(days=day_number - 1)
-
-
-def _build_sunday_planning_message() -> str:
-    lines = [
-        "Je nedeľa. Plánujeme týždeň. Počet tréningov dnes "
-        "nevyjednávame, iba ich dávame do kalendára.",
-        "",
-        "Aktívne záväzky:",
-    ]
-    with get_connection() as connection:
-        for user in list_active_users():
-            commitments = connection.execute(
-                """
-                SELECT workout_type, count_per_week
-                FROM commitments
-                WHERE user_id = ? AND is_active = 1
-                ORDER BY workout_type ASC
-                """,
-                (user["id"],),
-            ).fetchall()
-            summary = ", ".join(
-                f"{item['workout_type']} {item['count_per_week']}x"
-                for item in commitments
-            )
-            lines.append(f"- {user['display_name']}: {summary or 'bez záväzkov'}")
-    return "\n".join(lines)
-
-
-def _build_morning_message(target_date: date) -> str:
-    plans = get_plans_for_date(target_date)
-    if not plans:
-        return "Dobré ráno. Dnes nie je naplánovaný žiadny tréning."
-
-    lines = ["Dobré ráno. Dnešné tréningy:"]
-    for plan in plans:
-        lines.append(
-            f"- [{plan['plan_ref']}] {plan['display_name']}: "
-            f"{plan['workout_type']} o {plan['planned_time']}. "
-            f"{_personal_motivation(plan['display_name'])}"
-        )
-    return "\n".join(lines)
-
-
-def _build_evening_message(target_date: date) -> str | None:
-    plans = get_plans_for_date(target_date)
-    if not plans:
-        return None
-
-    lines = [
-        "Zajtra máš tréning. Nachystaj si veci už večer. "
-        "Ráno nechceme debatný krúžok s lenivosťou."
-    ]
-    for plan in plans:
-        lines.append(
-            f"- [{plan['plan_ref']}] {plan['display_name']}: "
-            f"{plan['workout_type']} o {plan['planned_time']}"
-        )
-    return "\n".join(lines)
-
-
-def _get_plans_due_for_check(now: datetime) -> list[dict]:
-    """Pri hodinovej kontrole vráti tréningy začaté pred 60 až 119 minútami."""
-    due_plans = []
-    for plan in get_plans_for_date(now.date()):
-        if plan["status"] not in {"planned", "postponed"}:
-            continue
-
-        hours, minutes = (int(part) for part in plan["planned_time"].split(":"))
-        planned_at = datetime.combine(
-            now.date(),
-            datetime.min.time().replace(hour=hours, minute=minutes),
-            tzinfo=now.tzinfo,
-        )
-        elapsed_minutes = (now - planned_at).total_seconds() / 60
-        if 60 <= elapsed_minutes < 120:
-            due_plans.append(plan)
-    return due_plans
-
-
-def _get_plans_starting_in_15_minutes(now: datetime) -> list[dict]:
-    """Vráti planned/postponed tréningy začínajúce presne o 15 minút."""
-    target = now + timedelta(minutes=15)
-    target_time = target.strftime("%H:%M")
-    return [
-        plan
-        for plan in get_plans_for_date(target.date())
-        if plan["status"] in {"planned", "postponed"}
-        and plan["planned_time"] == target_time
-    ]
-
-
-def _get_plan_reference(user_id: int, week_start: str, plan_id: int) -> int:
-    """Vráti lokálne číslo tréningu v používateľovom týždni."""
-    with get_connection() as connection:
-        rows = connection.execute(
-            """
-            SELECT id, planned_day, planned_time
-            FROM weekly_plans
-            WHERE user_id = ? AND week_start = ?
-            """,
-            (user_id, week_start),
-        ).fetchall()
-    rows = sorted(
-        rows,
-        key=lambda row: (
-            DAY_ORDER.get(row["planned_day"], 99),
-            row["planned_time"],
-            row["id"],
-        ),
-    )
-    for index, row in enumerate(rows, start=1):
-        if row["id"] == plan_id:
-            return index
-    return plan_id
-
-
-async def _send_once(client, key: str, message: str) -> None:
+async def _send_facts_once(client, key: str, facts: str, tone: str) -> bool:
+    if was_notification_sent(key):
+        return False
     channel = await get_channel(client)
     if channel is None:
-        return
-    await channel.send(message)
-    mark_notification_sent(key)
-
-
-async def _scheduled_reply(factual_message: str, tone: str) -> str:
-    """Vytvorí variabilnú trénerovskú pripomienku s bezpečným fallbackom."""
-    return await asyncio.to_thread(
+        return False
+    message = await asyncio.to_thread(
         generate_final_reply,
-        "Automatická pripomienka",
-        factual_message,
+        "Automatická správa schedulera",
+        facts,
         "scheduled_reminder",
         tone,
         None,
     )
+    await channel.send(message)
+    mark_notification_sent(key)
+    return True
 
 
-def _personal_motivation(display_name: str) -> str:
-    if display_name.strip().casefold() == "ema":
-        return (
-            "Dnes je tréningový deň. Stačí začať. "
-            "Nemusíš byť motivovaná, stačí byť obutá."
-        )
+def _users_missing_commitments(now: datetime) -> list[dict]:
+    cutoff = now.astimezone(timezone.utc) - timedelta(hours=2)
+    with get_connection() as connection:
+        rows = connection.execute(
+            """
+            SELECT users.*
+            FROM users
+            WHERE users.is_active = 1
+              AND NOT EXISTS (
+                  SELECT 1 FROM commitments
+                  WHERE commitments.user_id = users.id AND commitments.is_active = 1
+              )
+            ORDER BY users.id
+            """
+        ).fetchall()
+    result = []
+    for row in rows:
+        last = row["last_commitment_reminder_at"]
+        if not last or datetime.fromisoformat(last) <= cutoff:
+            result.append(dict(row))
+    return result
+
+
+def _group_plans(plans: list[dict]) -> dict[str, list[dict]]:
+    grouped: dict[str, list[dict]] = {}
+    for plan in plans:
+        grouped.setdefault(plan["discord_user_id"], []).append(plan)
+    return grouped
+
+
+def _personal_plan_facts(user_id: str, plans: list[dict], title: str) -> str:
+    summary = ", ".join(f"{plan['workout_type']} o {plan['planned_time']}" for plan in plans)
+    return f"<@{user_id}> {title}: {summary}."
+
+
+def _plans_starting_in_15_minutes(now: datetime) -> list[dict]:
+    target = now + timedelta(minutes=15)
+    return [
+        plan
+        for plan in get_plans_for_date(target.date())
+        if plan["status"] in {"planned", "postponed"}
+        and plan["planned_time"] == target.strftime("%H:%M")
+    ]
+
+
+def _elapsed_minutes(plan: dict, now: datetime) -> float:
+    hours, minutes = map(int, plan["planned_time"].split(":"))
+    planned_at = datetime.combine(
+        get_plan_date(plan["week_start"], plan["planned_day"]),
+        datetime.min.time().replace(hour=hours, minute=minutes),
+        tzinfo=now.tzinfo,
+    )
+    return (now - planned_at).total_seconds() / 60
+
+
+def _post_workout_facts(plan: dict) -> str:
+    fields = format_result_prompt(plan["activity_version_id"])
     return (
-        "Dnes je tréningový deň. Stačí začať. "
-        "Nemusíš byť motivovaný, stačí byť obutý."
+        f"<@{plan['discord_user_id']}> dokončil/a si aktivitu {plan['workout_type']}? "
+        f"Napíš tieto výsledky: {fields}."
     )
 
 
-def _had_workout_form(display_name: str) -> str:
-    if display_name.strip().casefold() == "ema":
-        return "mala si"
-    return "mal si"
+def _joker_available(user_id: int, week_start: str) -> bool:
+    with get_connection() as connection:
+        return connection.execute(
+            "SELECT 1 FROM jokers WHERE user_id = ? AND week_start = ?",
+            (user_id, week_start),
+        ).fetchone() is None
 
 
-def _planned_workout_form(display_name: str) -> str:
-    if display_name.strip().casefold() == "ema":
-        return "naplánovala si si"
-    return "naplánoval si si"
+def _day_name(target_date: date) -> str:
+    return next(name for name, order in DAY_ORDER.items() if order == target_date.weekday() + 1)

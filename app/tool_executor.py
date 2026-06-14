@@ -6,14 +6,20 @@ from app.database import get_connection
 from app.services.activity_service import (
     create_activity,
     format_activities,
+    get_active_activity,
     request_activity_change,
     resolve_activity_change,
 )
 from app.services.capabilities_service import get_help
 from app.services.rules_service import get_rules
 from app.services.training_query_service import query_training_data
-from app.services.commitment_change_service import list_changes, request_commitment_change, vote_change
-from app.services.commitments_service import list_commitments
+from app.services.commitment_change_service import (
+    change_commitment_type,
+    list_changes,
+    request_commitment_change,
+    vote_change,
+)
+from app.services.commitments_service import list_commitments, set_commitment
 from app.services.joker_service import joker_status, use_joker
 from app.services.onboarding_service import (
     confirm_onboarding,
@@ -36,6 +42,7 @@ from app.services.planning_service import (
     list_my_week,
     normalize_day,
     resolve_plan_reference,
+    start_week_planning,
     weekly_status,
 )
 from app.services.replacement_service import (
@@ -65,6 +72,10 @@ def execute_tool(
 def _execute_tool(tool_name: str, args: dict, discord_user_id: str):
     if tool_name == "get_my_week":
         return _service_result(list_my_week(discord_user_id), "system_info")
+    if tool_name == "show_week_plan":
+        return _service_result(
+            list_my_week(discord_user_id, args.get("target_week")), "system_info"
+        )
     if tool_name == "get_group_week":
         return True, list_all_week(), "system_info"
     if tool_name == "get_planning_status":
@@ -76,15 +87,19 @@ def _execute_tool(tool_name: str, args: dict, discord_user_id: str):
             get_user_month_stats(discord_user_id, args.get("month")), "stats"
         )
     if tool_name == "plan_workout":
-        return _service_result(
-            add_plan(
+        return _plan_workout_tool(discord_user_id, args)
+    if tool_name == "start_week_planning":
+        target_week = args.get("target_week") or "current_week"
+        result = start_week_planning(discord_user_id, target_week)
+        if result[0]:
+            create_pending_action(
                 discord_user_id,
-                _required(args, "workout_type"),
-                _required(args, "day"),
-                _required(args, "time"),
-            ),
-            "planning",
-        )
+                "week_planning",
+                result[1],
+                ["plan_slots"],
+                {"target_week": target_week},
+            )
+        return _service_result(result, "planning")
     if tool_name == "move_workout":
         return _move_workout(discord_user_id, args)
     if tool_name == "delete_workout":
@@ -108,12 +123,32 @@ def _execute_tool(tool_name: str, args: dict, discord_user_id: str):
         return _confirmed_joker_move(discord_user_id, args)
     if tool_name == "get_joker_status":
         return _service_result(joker_status(discord_user_id), "system_info")
-    if tool_name == "request_commitment_change":
+    if tool_name in {"request_commitment_change", "start_commitment_change_approval"}:
         return _service_result(
             request_commitment_change(
                 discord_user_id,
                 _required(args, "workout_type"),
                 _required_int(args, "count_per_week"),
+            ),
+            "planning",
+        )
+    if tool_name == "change_commitment":
+        if args.get("old_activity_name") and args.get("new_activity_name"):
+            return _change_commitment_type_tool(discord_user_id, args)
+        return _service_result(
+            request_commitment_change(
+                discord_user_id,
+                _required(args, "workout_type"),
+                _required_int(args, "count_per_week"),
+            ),
+            "planning",
+        )
+    if tool_name == "vote_commitment_change":
+        return _service_result(
+            vote_change(
+                discord_user_id,
+                _required_int(args, "request_id"),
+                _normalize_vote(_required(args, "vote")),
             ),
             "planning",
         )
@@ -126,17 +161,15 @@ def _execute_tool(tool_name: str, args: dict, discord_user_id: str):
     if tool_name == "list_commitment_changes":
         return True, list_changes(), "system_info"
     if tool_name == "request_workout_replacement":
+        return _replacement_request_tool(discord_user_id, args)
+    if tool_name == "vote_workout_replacement":
+        function = (
+            approve_replacement
+            if _normalize_vote(_required(args, "vote")) == "approve"
+            else reject_replacement
+        )
         return _service_result(
-            request_workout_replacement(
-                discord_user_id,
-                args.get("plan_ref"),
-                args.get("original_description"),
-                _required(args, "workout_type"),
-                _required(args, "day"),
-                _required(args, "time"),
-                _required(args, "reason"),
-            ),
-            "system_info",
+            function(discord_user_id, _required_int(args, "request_id")), "system_info"
         )
     if tool_name == "approve_replacement":
         return _service_result(
@@ -154,6 +187,8 @@ def _execute_tool(tool_name: str, args: dict, discord_user_id: str):
         return True, get_replacement_detail(_required_int(args, "request_id")), "system_info"
     if tool_name == "start_onboarding":
         return _service_result(start_onboarding(discord_user_id), "system_info")
+    if tool_name == "save_commitments":
+        return _save_commitments_tool(discord_user_id, args)
     if tool_name == "continue_onboarding":
         answer = args.get("answer")
         result = (
@@ -168,8 +203,21 @@ def _execute_tool(tool_name: str, args: dict, discord_user_id: str):
         return _service_result(reset_onboarding(discord_user_id), "system_info")
     if tool_name == "list_activity_types":
         return True, format_activities(), "system_info"
-    if tool_name == "create_activity":
+    if tool_name in {"create_activity", "create_activity_with_fields"}:
         return _create_activity_tool(discord_user_id, args)
+    if tool_name == "ask_for_activity_fields":
+        name = _required(args, "activity_name")
+        create_pending_action(
+            discord_user_id,
+            "create_activity",
+            f"Vytvorenie aktivity {name}",
+            ["activity_fields"],
+            {"activity_name": name, "activity_fields": []},
+        )
+        return False, (
+            f"Aké údaje chceš zapisovať pri aktivite `{name}`? "
+            "Uveď názvy a typy: číslo, trvanie, text alebo hodnotenie."
+        ), "clarify"
     if tool_name == "request_activity_edit":
         return _service_result(
             request_activity_change(
@@ -249,6 +297,21 @@ def _execute_tool(tool_name: str, args: dict, discord_user_id: str):
         return True, args.get("question") or args.get("answer") or "", "casual"
     if tool_name == "ask_clarifying_question":
         return True, args.get("question") or "Čo presne chceš spraviť?", "clarify"
+    if tool_name == "log_workout":
+        status = _required(args, "status").casefold()
+        functions = {
+            "completed": (complete_workout, "training_success"),
+            "shortened": (shorten_workout, "training_edit"),
+        }
+        if status == "missed":
+            plan_id = _resolve_ref(discord_user_id, _required_int(args, "plan_ref"))
+            return _service_result(miss_workout(discord_user_id, plan_id), "training_missed")
+        if status not in functions:
+            return False, "Stav musí byť completed, shortened alebo missed.", "user_error"
+        function, result_type = functions[status]
+        return _workout_result(function, discord_user_id, args, result_type)
+    if tool_name == "reply_only":
+        return True, args.get("answer") or args.get("question") or "", "casual"
     return False, f"Tool `{tool_name}` nie je podporovaný.", "user_error"
 
 
@@ -269,8 +332,12 @@ def _move_workout(discord_user_id: str, args: dict) -> tuple[bool, str, str]:
 
         old_order = DAY_ORDER[plan["planned_day"]]
         new_order = DAY_ORDER[new_day]
-        if new_order > old_order:
-            if new_order - old_order > 1:
+        moves_forward = new_order > old_order or (
+            plan["planned_day"] == "nedela" and new_day == "pondelok"
+        )
+        if moves_forward:
+            day_shift = 1 if new_order < old_order else new_order - old_order
+            if day_shift > 1:
                 return False, "Žolík môže posunúť tréning maximálne o jeden deň.", "user_error"
             joker = connection.execute(
                 "SELECT id FROM jokers WHERE user_id = ? AND week_start = ?",
@@ -307,11 +374,35 @@ def _move_workout(discord_user_id: str, args: dict) -> tuple[bool, str, str]:
     return True, f"Tréning [{plan_ref}] je presunutý na {new_day} {new_time}.", "planning"
 
 
+def _plan_workout_tool(discord_user_id: str, args: dict) -> tuple[bool, str, str]:
+    pending = get_latest_pending_action(discord_user_id)
+    target_week = args.get("target_week")
+    if pending and pending["intent"] == "week_planning":
+        target_week = pending["parsed_json"].get("target_week") or target_week
+    result = add_plan(
+        discord_user_id,
+        _required(args, "workout_type"),
+        _required(args, "day"),
+        _required(args, "time"),
+        target_week,
+    )
+    if result[0] and pending and pending["intent"] == "week_planning":
+        status = weekly_status(discord_user_id, target_week)
+        if status[0] and "chýba" not in status[1]:
+            resolve_pending_action(pending["id"])
+    return _service_result(result, "planning")
+
+
 def _create_activity_tool(discord_user_id: str, args: dict) -> tuple[bool, str, str]:
     pending = get_latest_pending_action(discord_user_id)
     name = args.get("activity_name")
     fields = args.get("activity_fields") or []
-    if pending and pending["intent"] == "create_activity":
+    if pending and pending["intent"] in {
+        "create_activity",
+        "save_commitments",
+        "replacement_activity",
+        "commitment_type_activity",
+    }:
         name = name or pending["parsed_json"].get("activity_name")
         fields = fields or pending["parsed_json"].get("activity_fields") or []
     if not name or not fields:
@@ -330,7 +421,116 @@ def _create_activity_tool(discord_user_id: str, args: dict) -> tuple[bool, str, 
     result = create_activity(discord_user_id, str(name), fields)
     if result[0] and pending and pending["intent"] == "create_activity":
         resolve_pending_action(pending["id"])
+    if result[0] and pending and pending["intent"] == "save_commitments":
+        resolve_pending_action(pending["id"])
+        return _save_commitments_tool(
+            discord_user_id, {"commitments": pending["parsed_json"]["commitments"]}
+        )
+    if result[0] and pending and pending["intent"] == "replacement_activity":
+        resolve_pending_action(pending["id"])
+        return _replacement_request_tool(discord_user_id, pending["parsed_json"])
+    if result[0] and pending and pending["intent"] == "commitment_type_activity":
+        resolve_pending_action(pending["id"])
+        return _change_commitment_type_tool(discord_user_id, pending["parsed_json"])
     return _service_result(result, "system_info")
+
+
+def _save_commitments_tool(discord_user_id: str, args: dict) -> tuple[bool, str, str]:
+    commitments = args.get("commitments") or []
+    if not commitments:
+        return False, "Napíš aktivity aj počet tréningov za týždeň.", "clarify"
+    saved = []
+    for item in commitments:
+        name = str(item.get("activity_name") or "").strip()
+        count = int(item.get("count_per_week") or 0)
+        if not name or count <= 0:
+            return False, "Každý commitment potrebuje aktivitu a kladný počet.", "user_error"
+        with get_connection() as connection:
+            activity = get_active_activity(name, connection)
+        if activity is None:
+            create_pending_action(
+                discord_user_id,
+                "save_commitments",
+                "Onboarding commitments",
+                ["activity_fields"],
+                {"activity_name": name, "commitments": commitments},
+            )
+            return False, (
+                f"Aktivita `{name}` ešte nemá schému. Aké údaje pri nej chceš zapisovať? "
+                "Uveď názvy a typy: číslo, trvanie, text alebo hodnotenie."
+            ), "clarify"
+        success, message = set_commitment(discord_user_id, name, count)
+        if not success:
+            return False, message, "user_error"
+        saved.append(f"{name} {count}x")
+    with get_connection() as connection:
+        connection.execute(
+            """
+            UPDATE onboarding_sessions SET is_active = 0, updated_at = ?
+            WHERE discord_user_id = ?
+            """,
+            (datetime.now(timezone.utc).isoformat(), discord_user_id),
+        )
+    return True, "Commitments sú nastavené: " + ", ".join(saved) + ".", "planning"
+
+
+def _replacement_request_tool(discord_user_id: str, args: dict) -> tuple[bool, str, str]:
+    workout_type = _required(args, "workout_type")
+    with get_connection() as connection:
+        activity = get_active_activity(workout_type, connection)
+    if activity is None:
+        create_pending_action(
+            discord_user_id,
+            "replacement_activity",
+            "Nová aktivita pre náhradu tréningu",
+            ["activity_fields"],
+            {**args, "activity_name": workout_type},
+        )
+        return False, (
+            f"Aktivita `{workout_type}` ešte neexistuje. Aké údaje pri nej chceš zapisovať? "
+            "Uveď názvy a typy: číslo, trvanie, text alebo hodnotenie."
+        ), "clarify"
+    return _service_result(
+        request_workout_replacement(
+            discord_user_id,
+            args.get("plan_ref"),
+            args.get("original_description"),
+            workout_type,
+            _required(args, "day"),
+            _required(args, "time"),
+            _required(args, "reason"),
+        ),
+        "system_info",
+    )
+
+
+def _change_commitment_type_tool(
+    discord_user_id: str, args: dict
+) -> tuple[bool, str, str]:
+    new_activity = _required(args, "new_activity_name")
+    with get_connection() as connection:
+        activity = get_active_activity(new_activity, connection)
+    if activity is None:
+        create_pending_action(
+            discord_user_id,
+            "commitment_type_activity",
+            "Nová aktivita pre zmenu commitmentu",
+            ["activity_fields"],
+            {**args, "activity_name": new_activity},
+        )
+        return False, (
+            f"Aktivita `{new_activity}` ešte neexistuje. Aké údaje pri nej chceš zapisovať? "
+            "Uveď názvy a typy: číslo, trvanie, text alebo hodnotenie."
+        ), "clarify"
+    return _service_result(
+        change_commitment_type(
+            discord_user_id,
+            _required(args, "old_activity_name"),
+            new_activity,
+            _required_int(args, "count_per_week"),
+        ),
+        "planning",
+    )
 
 
 def _confirmed_joker_move(discord_user_id: str, args: dict) -> tuple[bool, str, str]:
@@ -491,3 +691,8 @@ def _required_int(args: dict, key: str) -> int:
 
 def _without_none(values: dict) -> dict:
     return {key: value for key, value in values.items() if value is not None}
+
+
+def _normalize_vote(value: str) -> str:
+    normalized = value.casefold()
+    return "reject" if any(word in normalized for word in ("reject", "nie", "nesúhlas")) else "approve"

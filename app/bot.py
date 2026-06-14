@@ -1,4 +1,4 @@
-import asyncio
+﻿import asyncio
 import json
 import re
 
@@ -72,7 +72,7 @@ from app.services.stats_service import (
     get_all_month_stats,
     get_user_month_stats,
 )
-from app.services.users_service import list_users, register_user
+from app.services.users_service import ensure_user_exists, list_users
 from app.services.workout_service import (
     complete_workout,
     get_workout_detail,
@@ -101,6 +101,7 @@ WORKOUT_FORMAT_MESSAGE = (
 
 intents = discord.Intents.default()
 intents.message_content = True
+intents.members = True
 
 client = discord.Client(intents=intents)
 
@@ -390,7 +391,7 @@ async def _send_agent_result(
     tone: str,
     ai_context: str,
 ) -> None:
-    if result_type in {"system_info", "user_error", "clarify"}:
+    if result_type in {"user_error", "clarify"}:
         await message.channel.send(factual_result)
         return
 
@@ -690,6 +691,45 @@ async def on_ready() -> None:
     start_scheduler(client)
 
 
+async def _send_onboarding_welcome(channel, discord_user_id: str, display_name: str) -> None:
+    start_onboarding(discord_user_id)
+    factual = (
+        f"<@{discord_user_id}> vitaj v Couple GlowUp. Jonáš ti pomôže držať weekly "
+        "commitments, plánovať tréningy a zapisovať výsledky. Napíš jednou vetou, "
+        "aké aktivity chceš robiť a koľkokrát týždenne. Pri nových aktivitách sa potom "
+        "spýtam, aké výsledky chceš sledovať."
+    )
+    reply = await asyncio.to_thread(
+        generate_final_reply,
+        "Automatické privítanie nového používateľa",
+        factual,
+        "scheduled_reminder",
+        "supportive",
+        f"Používateľ: {display_name}",
+    )
+    await channel.send(reply)
+
+
+@client.event
+async def on_member_join(member: discord.Member) -> None:
+    if getattr(member, "bot", False):
+        return
+    created, _ = ensure_user_exists(str(member.id), member.display_name)
+    if not created or not DISCORD_CHANNEL_ID:
+        return
+    try:
+        channel = client.get_channel(int(DISCORD_CHANNEL_ID))
+    except ValueError:
+        return
+    if channel is None:
+        try:
+            channel = await client.fetch_channel(int(DISCORD_CHANNEL_ID))
+        except Exception:
+            return
+    if channel is not None:
+        await _send_onboarding_welcome(channel, str(member.id), member.display_name)
+
+
 @client.event
 async def on_message(message: discord.Message) -> None:
     # Bot ignoruje vlastné správy.
@@ -698,46 +738,24 @@ async def on_message(message: discord.Message) -> None:
 
     discord_user_id = str(message.author.id)
     channel_id = str(message.channel.id)
-    should_store_message = bool(
-        DISCORD_CHANNEL_ID and channel_id == DISCORD_CHANNEL_ID.strip()
-    )
+    author_name = getattr(message.author, "display_name", str(message.author))
+    created, _ = ensure_user_exists(discord_user_id, author_name)
+    save_channel_message(discord_user_id, author_name, channel_id, message.content)
+    if created:
+        await _send_onboarding_welcome(message.channel, discord_user_id, author_name)
 
     command_text = _extract_command_text(message)
     is_pending_follow_up = False
     pending_action = get_latest_pending_action(discord_user_id)
     active_onboarding = has_active_onboarding(discord_user_id)
     if command_text is None:
-        if should_store_message:
-            save_channel_message(
-                discord_user_id,
-                getattr(message.author, "display_name", str(message.author)),
-                channel_id,
-                message.content,
-            )
-        if active_onboarding and should_store_message:
-            _, response = process_onboarding_answer(discord_user_id, message.content)
-            await message.channel.send(response)
-        return
-    is_onboarding_follow_up = active_onboarding and not command_text.casefold().startswith(
-        "onboarding "
-    )
-
-    ai_context = build_ai_context(discord_user_id, channel_id)
+        if not active_onboarding:
+            return
+        command_text = message.content.strip()
+    ai_context = build_ai_context(discord_user_id, channel_id, 5)
     pending_context = build_pending_context(pending_action)
-    if should_store_message:
-        save_channel_message(
-            discord_user_id,
-            getattr(message.author, "display_name", str(message.author)),
-            channel_id,
-            message.content,
-        )
 
     normalized_command = command_text.casefold()
-
-    if is_onboarding_follow_up and pending_action is None:
-        _, response = process_onboarding_answer(discord_user_id, command_text)
-        await message.channel.send(response)
-        return
 
     if normalized_command == "help":
         await message.channel.send(get_help())
@@ -818,12 +836,6 @@ async def on_message(message: discord.Message) -> None:
             return
 
         await _natural_coach_response(message, event_type, factual_result)
-        return
-
-    if normalized_command.startswith("register "):
-        display_name = command_text[len("register ") :].strip()
-        success, response = register_user(str(message.author.id), display_name)
-        await message.channel.send(_coach_service_response(success, response, "success"))
         return
 
     if normalized_command == "users":
@@ -1128,7 +1140,6 @@ async def on_message(message: discord.Message) -> None:
             await message.channel.send(respond_error(response))
         return
 
-    author_name = getattr(message.author, "display_name", str(message.author))
     try:
         agent_decision = await _decide_with_agent(
             command_text, author_name, ai_context, pending_context

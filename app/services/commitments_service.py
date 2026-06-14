@@ -53,6 +53,14 @@ def set_commitment(
                 ),
             )
             action = "nový"
+        connection.execute(
+            """
+            UPDATE users
+            SET onboarding_state = 'complete', last_commitment_reminder_at = NULL
+            WHERE id = ?
+            """,
+            (user["id"],),
+        )
     return True, f"{user['display_name']} má {action} záväzok: {activity['display_name']} {count_per_week}x týždenne."
 
 

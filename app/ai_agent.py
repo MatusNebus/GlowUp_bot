@@ -10,11 +10,13 @@ from app.services.rules_service import get_rules
 
 TOOLS = [
     "get_my_week",
+    "show_week_plan",
     "get_group_week",
     "get_planning_status",
     "get_commitments",
     "get_stats",
     "plan_workout",
+    "start_week_planning",
     "move_workout",
     "delete_workout",
     "set_workout_status",
@@ -25,20 +27,27 @@ TOOLS = [
     "use_joker",
     "get_joker_status",
     "request_commitment_change",
+    "change_commitment",
+    "start_commitment_change_approval",
+    "vote_commitment_change",
     "approve_commitment_change",
     "reject_commitment_change",
     "list_commitment_changes",
     "request_workout_replacement",
+    "vote_workout_replacement",
     "approve_replacement",
     "reject_replacement",
     "list_replacements",
     "get_replacement_detail",
     "start_onboarding",
+    "save_commitments",
     "continue_onboarding",
     "confirm_onboarding",
     "reset_onboarding",
     "list_activity_types",
     "create_activity",
+    "create_activity_with_fields",
+    "ask_for_activity_fields",
     "request_activity_edit",
     "request_activity_deactivation",
     "approve_activity_change",
@@ -49,6 +58,8 @@ TOOLS = [
     "answer_general_training_question",
     "casual_reply",
     "ask_clarifying_question",
+    "log_workout",
+    "reply_only",
 ]
 
 
@@ -77,6 +88,19 @@ RESULT_VALUES_SCHEMA = {
         "type": "object",
         "properties": {"field_key": {"type": "string"}, "value": {"type": "string"}},
         "required": ["field_key", "value"],
+        "additionalProperties": False,
+    },
+}
+
+COMMITMENTS_SCHEMA = {
+    "type": "array",
+    "items": {
+        "type": "object",
+        "properties": {
+            "activity_name": {"type": "string"},
+            "count_per_week": {"type": "integer", "minimum": 1},
+        },
+        "required": ["activity_name", "count_per_week"],
         "additionalProperties": False,
     },
 }
@@ -117,7 +141,11 @@ ARGS_SCHEMA = {
         "reason": _nullable("string"),
         "activity_name": _nullable("string"),
         "new_activity_name": _nullable("string"),
+        "old_activity_name": _nullable("string"),
+        "target_week": _nullable("string"),
+        "vote": _nullable("string"),
         "activity_fields": ACTIVITY_FIELDS_SCHEMA,
+        "commitments": COMMITMENTS_SCHEMA,
         "result_values": RESULT_VALUES_SCHEMA,
         "query": QUERY_SCHEMA,
     },
@@ -139,7 +167,11 @@ ARGS_SCHEMA = {
         "reason",
         "activity_name",
         "new_activity_name",
+        "old_activity_name",
+        "target_week",
+        "vote",
         "activity_fields",
+        "commitments",
         "result_values",
         "query",
     ],
@@ -193,6 +225,15 @@ Rozhodovacie pravidlá:
   je otvorená práve jedna náhrada. Analogicky reject_replacement.
 - "ukáž otvorené náhrady" je list_replacements.
 - Zmenu záväzku rieš cez request_commitment_change.
+- Zvýšenie alebo zníženie počtu rieš cez change_commitment. Python rozhodne, či treba hlasovanie.
+- Zmenu typu záväzku bez zníženia počtu rieš cez change_commitment s old_activity_name,
+  new_activity_name a count_per_week.
+- Pri používateľovi bez záväzkov extrahuj všetky aktivity a počty do save_commitments.
+  Ak aktivita neexistuje, Python si vypýta jej používateľom definované polia.
+- Počas automatického onboardingu používaj save_commitments, nie starý continue_onboarding.
+- Žiadosť o plánovanie tohto alebo budúceho týždňa rieš cez start_week_planning a target_week.
+- Pri plan_workout nastav target_week podľa konverzácie; bez údaja použi current_week.
+- Ak je otvorená pending akcia week_planning, pri ďalších plan_workout použi jej target_week.
 - Presun na rovnaký alebo skorší deň rieš move_workout.
 - Presun na neskorší deň tiež začni cez move_workout; Python vyžiada potvrdenie žolíka.
 - Ak kontext obsahuje pending confirm_joker_move a používateľ jasne potvrdí,

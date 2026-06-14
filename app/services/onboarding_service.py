@@ -31,10 +31,14 @@ UNCLEAR_MESSAGE = (
 def start_onboarding(discord_user_id: str) -> tuple[bool, str]:
     """Spustí krátky onboarding a vymaže starý nepotvrdený návrh."""
     if _get_user(discord_user_id) is None:
-        return False, "Najprv sa zaregistruj cez: jonas register <meno>"
+        return False, "Používateľa sa nepodarilo automaticky zaregistrovať."
 
     now = datetime.now(timezone.utc).isoformat()
     with get_connection() as connection:
+        connection.execute(
+            "UPDATE users SET onboarding_state = 'needs_commitments' WHERE discord_user_id = ?",
+            (discord_user_id,),
+        )
         connection.execute(
             """
             INSERT INTO onboarding_sessions (
@@ -116,7 +120,7 @@ def confirm_onboarding(discord_user_id: str) -> tuple[bool, str]:
 def get_onboarding_status(discord_user_id: str) -> tuple[bool, str]:
     """Debug stav ukazuje iba aktivitu, poslednú odpoveď a návrh."""
     if _get_user(discord_user_id) is None:
-        return False, "Najprv sa zaregistruj cez: jonas register <meno>"
+        return False, "Používateľa sa nepodarilo automaticky zaregistrovať."
 
     session = _get_session(discord_user_id)
     if session is None:
@@ -134,7 +138,7 @@ def get_onboarding_status(discord_user_id: str) -> tuple[bool, str]:
 
 def reset_onboarding(discord_user_id: str) -> tuple[bool, str]:
     if _get_user(discord_user_id) is None:
-        return False, "Najprv sa zaregistruj cez: jonas register <meno>"
+        return False, "Používateľa sa nepodarilo automaticky zaregistrovať."
     with get_connection() as connection:
         connection.execute(
             "DELETE FROM onboarding_sessions WHERE discord_user_id = ?",

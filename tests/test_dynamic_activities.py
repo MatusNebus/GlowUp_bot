@@ -204,7 +204,7 @@ class DynamicActivitiesTest(unittest.TestCase):
 
 
 class MigrationTest(unittest.TestCase):
-    def test_v2_migration_preserves_users_and_messages_and_runs_once(self):
+    def test_migration_preserves_users_messages_and_legacy_training_data(self):
         with tempfile.TemporaryDirectory(dir=".") as temp:
             path = Path(temp) / "legacy.db"
             connection = sqlite3.connect(path)
@@ -232,10 +232,11 @@ class MigrationTest(unittest.TestCase):
                 database.init_database()
                 database.init_database()
                 with database.get_connection() as current:
-                    self.assertEqual(2, current.execute("PRAGMA user_version").fetchone()[0])
+                    self.assertEqual(3, current.execute("PRAGMA user_version").fetchone()[0])
                     self.assertEqual(1, current.execute("SELECT COUNT(*) FROM users").fetchone()[0])
                     self.assertEqual(1, current.execute("SELECT COUNT(*) FROM message_memory").fetchone()[0])
                     self.assertEqual(0, current.execute("SELECT COUNT(*) FROM weekly_plans").fetchone()[0])
+                    self.assertEqual(1, current.execute("SELECT COUNT(*) FROM weekly_plans_legacy_v1").fetchone()[0])
                     self.assertEqual(0, current.execute("SELECT COUNT(*) FROM activity_types").fetchone()[0])
             finally:
                 database.DB_PATH = original

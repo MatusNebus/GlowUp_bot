@@ -1,8 +1,11 @@
 from datetime import date, datetime, timedelta, timezone
+from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
+from app.config import BOT_TIMEZONE
 from app.database import get_connection
 from app.services.planning_service import DAY_ORDER, get_current_week_start
 from app.services.activity_service import list_activities
+from app.services.rules_service import get_rules
 
 
 def save_channel_message(
@@ -40,10 +43,14 @@ def save_user_message(discord_user_id: str, message_text: str) -> None:
 
 
 def build_ai_context(
-    discord_user_id: str, channel_id: str | None = None, message_limit: int = 10
+    discord_user_id: str, channel_id: str | None = None, message_limit: int = 5
 ) -> str:
     """Pripraví stručný kontext používateľa, plánu a posledných správ kanála."""
-    today = date.today()
+    try:
+        local_now = datetime.now(ZoneInfo(BOT_TIMEZONE))
+    except ZoneInfoNotFoundError:
+        local_now = datetime.now().astimezone()
+    today = local_now.date()
     tomorrow = today + timedelta(days=1)
     week_start = get_current_week_start()
 
@@ -97,6 +104,15 @@ def build_ai_context(
             WHERE user_id = ? AND week_start = ?
             """,
             (user["id"], week_start),
+        ).fetchall()
+        next_week_start = (date.fromisoformat(week_start) + timedelta(days=7)).isoformat()
+        next_week_plans = connection.execute(
+            """
+            SELECT id, activity_version_id, workout_type, planned_day, planned_time, status
+            FROM weekly_plans
+            WHERE user_id = ? AND week_start = ?
+            """,
+            (user["id"], next_week_start),
         ).fetchall()
         commitments = connection.execute(
             """
@@ -170,7 +186,7 @@ def build_ai_context(
             }
         )
 
-    return _format_context(
+    context = _format_context(
         discord_user_id,
         user["display_name"],
         today,
@@ -183,6 +199,24 @@ def build_ai_context(
         list_activities(),
         activity_changes,
     )
+    next_lines = ["", f"Plán budúceho týždňa od {next_week_start}:"]
+    next_lines.extend(
+        f"- {plan['workout_type']}; {plan['planned_day']} {plan['planned_time']}; status={plan['status']}"
+        for plan in next_week_plans
+    )
+    if not next_week_plans:
+        next_lines.append("- bez tréningov")
+    next_lines.extend(
+        [
+            "",
+            f"Aktuálny lokálny čas: {local_now.isoformat()}",
+            f"Timezone: {BOT_TIMEZONE}",
+            "",
+            "PLNÉ PRAVIDLÁ SYSTÉMU:",
+            get_rules(),
+        ]
+    )
+    return context + "\n" + "\n".join(next_lines)
 
 
 def _format_context(

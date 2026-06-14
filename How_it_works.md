@@ -8,7 +8,7 @@ dokument opisuje, **ako je bot reálne naprogramovaný teraz**.
 
 Couple GlowUp Bot je Discord fitness tréner s menom Jonáš. Pomáha malej skupine:
 
-- zaregistrovať používateľov a nastaviť im týždenné tréningové záväzky,
+- automaticky zaregistrovať používateľov a nastaviť im týždenné tréningové záväzky,
 - rozložiť záväzky na konkrétne dni a časy,
 - zapísať splnené, skrátené alebo vynechané tréningy,
 - raz týždenne posunúť tréning pomocou žolíka,
@@ -104,7 +104,8 @@ python -m app.main
 
 Tok pri štarte:
 
-1. `app/main.py` zavolá `init_database()`.
+1. `app/main.py` zavolá `init_database()`; migrácie iba dopĺňajú alebo bezpečne
+   odkladajú nekompatibilné legacy tabuľky, existujúce dáta nemažú.
 2. `app/database.py` vytvorí chýbajúce SQLite tabuľky.
 3. `app/main.py` zavolá `run_bot()`.
 4. `app/bot.py` pripojí Discord klienta pomocou `DISCORD_TOKEN`.
@@ -164,7 +165,6 @@ spracuje ako príkaz alebo prirodzený jazyk.
 **Pevné príkazy** sú explicitné formáty ako:
 
 ```text
-jonas register Matúš
 jonas plan beh piatok 18:00
 jonas done 1 5.2 32
 jonas stats 2026-06
@@ -262,13 +262,13 @@ Komunikuje priamo s tabuľkou `users`.
 
 ### `onboarding_service.py`
 
-- spustí onboarding,
-- z jednej vety vytiahne navrhované záväzky,
-- uloží rozpracovaný návrh,
-- po potvrdení zavolá `commitments_service.set_commitment()`.
+- spustí a eviduje onboarding automaticky po registrácii,
+- drží spätnú kompatibilitu pre starší regexový návrh a potvrdenie,
+- hlavný prirodzený onboarding smeruje cez AI tool `save_commitments`,
+- pri neznámej aktivite vytvorí pending flow na zadanie dynamických polí.
 
-Používa vlastný jednoduchý regex parser a tabuľku `onboarding_sessions`. Počas
-aktívneho onboardingu môže `bot.py` spracovať aj správu bez oslovenia „jonas“.
+Počas aktívneho onboardingu môže `bot.py` spracovať aj správu bez oslovenia
+„jonas“. Po uložení prvých commitments sa onboarding automaticky uzavrie.
 
 ### `commitments_service.py`
 
@@ -283,9 +283,10 @@ Servis:
 
 ### `commitment_change_service.py`
 
-Po onboardingu sa existujúci záväzok nemení len tak. Zmena vytvorí request a
-automaticky zapíše súhlas žiadateľa. Zmena sa aplikuje až vtedy, keď ju schvália
-všetci aktívni používatelia. Jeden nesúhlas request odmietne.
+Zvýšenie počtu sa aplikuje okamžite. Zníženie vytvorí request a automaticky
+zapíše súhlas žiadateľa; aplikuje sa až po súhlase všetkých aktívnych
+používateľov. Jeden nesúhlas request odmietne. Zmena typu pri zachovaní počtu
+nepotrebuje hlasovanie.
 
 Po jednomyseľnom súhlase tento servis zavolá `commitments_service.set_commitment()`.
 
@@ -294,7 +295,7 @@ Po jednomyseľnom súhlase tento servis zavolá `commitments_service.set_commitm
 Spravuje týždenný kalendár:
 
 - normalizuje slovenské dni a kontroluje čas,
-- pridáva tréning do aktuálneho týždňa,
+- pridáva tréning do aktuálneho alebo budúceho týždňa,
 - nedovolí naplánovať viac tréningov daného typu, než určuje záväzok,
 - vypisuje osobný aj skupinový týždeň,
 - porovnáva záväzky s naplánovanými tréningmi,
@@ -399,10 +400,13 @@ Automatické udalosti:
 |---|---|
 | nedeľa 19:00 | výzva na plánovanie týždňa |
 | každý deň 06:00 | ranný prehľad dnešných tréningov |
-| každý deň 20:00 | príprava na zajtrajšie tréningy |
+| každý deň 21:00 | príprava na zajtrajšie tréningy |
 | 15 minút pred tréningom | pripomienka začiatku |
-| 60 až 119 minút po začiatku | otázka na výsledok a stav `unanswered` |
-| 05:59 | pripomenutie včerajších nezodpovedaných tréningov |
+| 2 hodiny po začiatku | otázka na dynamické výsledky a stav `unanswered` |
+| každú ďalšiu hodinu do 22:00 | opakovanie otázky na nezodpovedaný tréning |
+| 05:59 | posledná výstraha k včerajšiemu nezodpovedanému tréningu |
+| 12:00 | automatický žolík alebo stav `missed` |
+| každé 2 hodiny medzi 06:00 a 22:00 | výzva používateľom bez commitments |
 
 Tabuľka `notification_log` zabezpečuje, že rovnaká automatická správa sa nepošle
 viackrát ani po opätovnom pripojení bota.
@@ -492,13 +496,13 @@ Stavy `completed`, `shortened`, `missed` a `replaced` sú prakticky ukončené.
 ### Registrácia a onboarding
 
 ```text
-Discord správa
-→ bot.py
-→ users_service.register_user()
+Discord member join alebo prvá ľudská správa
+→ users_service.ensure_user_exists()
 → users
 → onboarding_service.start_onboarding()
 → onboarding_sessions
-→ onboarding_service.confirm_onboarding()
+→ ai_agent + save_commitments
+→ prípadne pending zadanie polí novej aktivity
 → commitments_service.set_commitment()
 → commitments
 ```

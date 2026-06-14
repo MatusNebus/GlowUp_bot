@@ -38,6 +38,8 @@ def request_commitment_change(
             return set_commitment(requester_discord_user_id, normalized_type, new_count)
         if user["count_per_week"] == new_count:
             return False, "Takýto záväzok už máš nastavený."
+        if new_count > user["count_per_week"]:
+            return set_commitment(requester_discord_user_id, normalized_type, new_count)
 
         existing = connection.execute(
             """
@@ -85,7 +87,78 @@ def request_commitment_change(
         True,
         f"Návrh zmeny záväzku #{request_id}: {user['display_name']} chce zmeniť "
         f"{normalized_type} z {user['count_per_week']}x na {new_count}x týždenne. "
-        "Zmena prejde až po súhlase všetkých aktívnych používateľov.",
+        f"Zmena prejde až po jednomyseľnom súhlase. Hlasujú: {_pending_mentions(request_id)}. "
+        f"Odpovedzte `Jony, súhlasím so zmenou {request_id}` alebo "
+        f"`Jony, nesúhlasím so zmenou {request_id}`.",
+    )
+
+
+def change_commitment_type(
+    discord_user_id: str, old_workout_type: str, new_workout_type: str, count: int
+) -> tuple[bool, str]:
+    """Swap an activity without approval when the weekly total does not decrease."""
+    if count <= 0:
+        return False, "Počet tréningov musí byť väčší ako 0."
+    with get_connection() as connection:
+        user = connection.execute(
+            "SELECT id, display_name FROM users WHERE discord_user_id = ? AND is_active = 1",
+            (discord_user_id,),
+        ).fetchone()
+        old_activity = get_active_activity(old_workout_type, connection)
+        new_activity = get_active_activity(new_workout_type, connection)
+        if user is None:
+            return False, "Používateľ nie je aktívny."
+        if old_activity is None:
+            return False, f"Aktivita `{old_workout_type}` nie je v aktívnom katalógu."
+        if new_activity is None:
+            return False, (
+                f"Aktivita `{new_workout_type}` ešte neexistuje. "
+                "Najprv zadaj parametre, ktoré sa pri nej majú zapisovať."
+            )
+        current = connection.execute(
+            """
+            SELECT id, count_per_week FROM commitments
+            WHERE user_id = ? AND activity_type_id = ? AND is_active = 1
+            """,
+            (user["id"], old_activity["id"]),
+        ).fetchone()
+        if current is None:
+            return False, f"Nemáš aktívny záväzok `{old_workout_type}`."
+        if count < current["count_per_week"]:
+            return False, "Zmena typu nesmie znížiť počet tréningov bez hlasovania."
+        target = connection.execute(
+            """
+            SELECT id, count_per_week FROM commitments
+            WHERE user_id = ? AND activity_type_id = ? AND is_active = 1
+            """,
+            (user["id"], new_activity["id"]),
+        ).fetchone()
+        connection.execute(
+            "UPDATE commitments SET is_active = 0 WHERE id = ?", (current["id"],)
+        )
+        if target:
+            connection.execute(
+                "UPDATE commitments SET count_per_week = ? WHERE id = ?",
+                (target["count_per_week"] + count, target["id"]),
+            )
+        else:
+            connection.execute(
+                """
+                INSERT INTO commitments (
+                    user_id, activity_type_id, workout_type, count_per_week, created_at
+                ) VALUES (?, ?, ?, ?, ?)
+                """,
+                (
+                    user["id"],
+                    new_activity["id"],
+                    new_activity["display_name"],
+                    count,
+                    datetime.now(timezone.utc).isoformat(),
+                ),
+            )
+    return True, (
+        f"{user['display_name']} zmenil/a záväzok {old_activity['display_name']} "
+        f"{current['count_per_week']}x na {new_activity['display_name']} {count}x."
     )
 
 
@@ -211,3 +284,22 @@ def _apply_if_unanimous(request_id: int) -> tuple[bool, str]:
             (datetime.now(timezone.utc).isoformat(), request_id),
         )
     return True, f"Návrh #{request_id} schválili všetci aktívni používatelia. {result}"
+
+
+def _pending_mentions(request_id: int) -> str:
+    with get_connection() as connection:
+        rows = connection.execute(
+            """
+            SELECT users.discord_user_id
+            FROM users
+            WHERE users.is_active = 1
+              AND NOT EXISTS (
+                  SELECT 1 FROM commitment_change_votes votes
+                  WHERE votes.request_id = ?
+                    AND votes.voter_discord_user_id = users.discord_user_id
+              )
+            ORDER BY users.id
+            """,
+            (request_id,),
+        ).fetchall()
+    return " ".join(f"<@{row['discord_user_id']}>" for row in rows) or "nikto"
