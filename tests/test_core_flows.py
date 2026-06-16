@@ -14,9 +14,11 @@ from app.services.commitments_service import list_commitments, set_commitment
 from app.services.planning_service import add_plan, get_week_start
 from app.services.joker_service import use_joker
 from app.services.users_service import ensure_user_exists
+from app.services.scheduler_service import _plans_starting_in_15_minutes
 from app.services.scheduler_service import _users_missing_commitments
 from app.services.context_service import build_ai_context, save_channel_message
 from app.tool_executor import execute_tool
+from app.ai_agent import _parse_agent_decision
 from app.bot import _natural_approval_result, send_and_remember
 
 
@@ -155,6 +157,40 @@ class CoreFlowTests(unittest.TestCase):
             )
         self.assertNotIn("2", [user["discord_user_id"] for user in _users_missing_commitments(now)])
 
+    def test_preworkout_reminder_uses_due_window_and_notification_log(self):
+        now = datetime.now(timezone.utc)
+        with database.get_connection() as connection:
+            activity_version = connection.execute("SELECT id FROM activity_versions LIMIT 1").fetchone()
+            user = connection.execute("SELECT id FROM users WHERE discord_user_id = '1'").fetchone()
+            connection.execute(
+                """
+                INSERT INTO weekly_plans (
+                    user_id, activity_version_id, week_start, workout_type,
+                    planned_day, planned_time, status, created_at
+                ) VALUES (?, ?, '2026-06-15', 'beh', 'utorok', '18:00', 'planned', ?)
+                """,
+                (user["id"], activity_version["id"], now.isoformat()),
+            )
+
+        reminder_time = datetime(2026, 6, 16, 17, 50, tzinfo=timezone.utc)
+        plans = _plans_starting_in_15_minutes(reminder_time)
+        self.assertEqual(len(plans), 1)
+
+        with database.get_connection() as connection:
+            connection.execute(
+                "INSERT INTO notification_log (notification_key, sent_at) VALUES (?, ?)",
+                (f"preworkout:{plans[0]['id']}", reminder_time.isoformat()),
+            )
+        self.assertEqual(_plans_starting_in_15_minutes(reminder_time), [])
+
+    def test_ai_agent_parser_ignores_extra_data_after_json(self):
+        class FakeResponse:
+            output = []
+            output_parsed = None
+            output_text = '{"mode":"reply"}{"ignored":true}'
+
+        self.assertEqual(_parse_agent_decision(FakeResponse()), {"mode": "reply"})
+
     def test_context_contains_human_and_bot_messages_in_order(self):
         save_channel_message("1", "Matúš", "channel-1", "prvá správa")
         save_channel_message("jonas", "Jonáš", "channel-1", "moja otázka", is_bot=True)
@@ -184,7 +220,7 @@ class CoreFlowTests(unittest.TestCase):
             def __init__(self):
                 self.sent = []
 
-            async def send(self, content):
+            async def send(self, content, **kwargs):
                 self.sent.append(content)
                 return content
 

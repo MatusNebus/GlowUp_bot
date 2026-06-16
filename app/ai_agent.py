@@ -305,7 +305,7 @@ def decide_agent_action(
             },
             max_output_tokens=800,
         )
-        decision = json.loads(response.output_text)
+        decision = _parse_agent_decision(response)
         logger.debug(
             "AI agent decision mode=%s tool=%s args=%s reply_intent=%s json_parse=success",
             decision.get("mode"),
@@ -317,3 +317,29 @@ def decide_agent_action(
     except Exception:
         logger.exception("AI agent failed json_parse=error")
         raise
+
+
+def _parse_agent_decision(response) -> dict:
+    parsed = getattr(response, "output_parsed", None)
+    if parsed is not None:
+        return parsed
+
+    for output_item in getattr(response, "output", []) or []:
+        for content_item in getattr(output_item, "content", []) or []:
+            parsed = getattr(content_item, "parsed", None)
+            if parsed is not None:
+                return parsed
+
+    text = (getattr(response, "output_text", "") or "").strip()
+    try:
+        return json.loads(text)
+    except json.JSONDecodeError:
+        start = text.find("{")
+        if start == -1:
+            raise
+        decoder = json.JSONDecoder()
+        decision, end = decoder.raw_decode(text[start:])
+        extra = text[start + end :].strip()
+        if extra:
+            logger.debug("AI agent response had trailing data after JSON; ignored it")
+        return decision

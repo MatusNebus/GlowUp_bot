@@ -3,6 +3,8 @@ import logging
 from datetime import date, datetime, timedelta, timezone
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
+import discord
+
 from app.config import BOT_TIMEZONE, DISCORD_CHANNEL_ID
 from app.database import get_connection
 from app.services.activity_service import format_result_prompt
@@ -14,6 +16,7 @@ from app.services.workout_service import miss_workout
 
 
 _scheduler_task: asyncio.Task | None = None
+_channel_lookup_disabled = False
 logger = logging.getLogger(__name__)
 
 
@@ -36,19 +39,18 @@ async def scheduler_loop(client) -> None:
     while not client.is_closed():
         now = datetime.now(get_bot_timezone())
         try:
-            if now.minute in {0, 30}:
-                await send_commitment_reminders(client, now)
-            if now.weekday() == 6 and now.hour == 19 and now.minute == 0:
+            await send_commitment_reminders(client, now)
+            if _is_due_today(now, 19, 0) and now.weekday() == 6:
                 await send_sunday_planning_message(client, now)
-            if now.hour == 6 and now.minute == 0:
+            if _is_due_today(now, 6, 0):
                 await send_daily_morning_message(client, now)
-            if now.hour == 21 and now.minute == 0:
+            if _is_due_today(now, 21, 0):
                 await send_evening_preparation_message(client, now)
             await send_workout_upcoming_reminders(client, now)
             await send_post_workout_checks(client, now)
-            if now.hour == 5 and now.minute == 59:
+            if _is_due_today(now, 5, 59) and now.hour < 12:
                 await send_unanswered_reminders(client, now)
-            if now.hour == 12 and now.minute == 0:
+            if _is_due_today(now, 12, 0):
                 await resolve_unanswered_workouts(client, now)
         except Exception:
             logger.exception("Scheduler tick failed")
@@ -130,7 +132,7 @@ async def send_post_workout_checks(client, now: datetime) -> None:
         return
     for plan in get_plans_for_date(now.date()):
         elapsed = _elapsed_minutes(plan, now)
-        if plan["status"] in {"planned", "postponed"} and 120 <= elapsed < 180:
+        if plan["status"] in {"planned", "postponed"} and elapsed >= 120:
             key = f"postworkout_initial:{plan['id']}"
             if await _send_facts_once(client, key, _post_workout_facts(plan), "coach"):
                 with get_connection() as connection:
@@ -141,7 +143,7 @@ async def send_post_workout_checks(client, now: datetime) -> None:
                         """,
                         (plan["id"],),
                     )
-        elif plan["status"] == "unanswered" and elapsed >= 180 and now.minute == 0:
+        elif plan["status"] == "unanswered" and elapsed >= 180:
             key = f"postworkout_hourly:{plan['id']}:{now:%Y-%m-%d-%H}"
             await _send_facts_once(client, key, _post_workout_facts(plan), "strict")
 
@@ -243,6 +245,9 @@ def get_bot_timezone():
 
 
 async def get_channel(client):
+    global _channel_lookup_disabled
+    if _channel_lookup_disabled:
+        return None
     if not DISCORD_CHANNEL_ID:
         return None
     channel_id = int(DISCORD_CHANNEL_ID)
@@ -251,6 +256,20 @@ async def get_channel(client):
         return channel
     try:
         return await client.fetch_channel(channel_id)
+    except discord.NotFound:
+        _channel_lookup_disabled = True
+        logger.error(
+            "Scheduler je vypnutý: DISCORD_CHANNEL_ID=%s neexistuje alebo ho tento bot nevidí.",
+            channel_id,
+        )
+        return None
+    except discord.Forbidden:
+        _channel_lookup_disabled = True
+        logger.error(
+            "Scheduler je vypnutý: bot nemá prístup ku kanálu DISCORD_CHANNEL_ID=%s.",
+            channel_id,
+        )
+        return None
     except Exception:
         logger.exception("Scheduler nevie načítať kanál %s", channel_id)
         return None
@@ -270,7 +289,14 @@ async def _send_facts_once(client, key: str, facts: str, tone: str) -> bool:
         tone,
         None,
     )
-    await channel.send(message)
+    await channel.send(
+        message,
+        allowed_mentions=discord.AllowedMentions(
+            users=True,
+            roles=False,
+            everyone=False,
+        ),
+    )
     bot_user = getattr(client, "user", None)
     save_channel_message(
         str(getattr(bot_user, "id", "jonas")),
@@ -319,23 +345,41 @@ def _personal_plan_facts(user_id: str, plans: list[dict], title: str) -> str:
 
 
 def _plans_starting_in_15_minutes(now: datetime) -> list[dict]:
-    target = now + timedelta(minutes=15)
+    reminder_deadline = now + timedelta(minutes=15)
+    target_dates = {now.date(), reminder_deadline.date()}
+    plans = []
+    for target_date in target_dates:
+        plans.extend(get_plans_for_date(target_date))
     return [
         plan
-        for plan in get_plans_for_date(target.date())
+        for plan in plans
         if plan["status"] in {"planned", "postponed"}
-        and plan["planned_time"] == target.strftime("%H:%M")
+        and now < _planned_datetime(plan, now) <= reminder_deadline
+        and not was_notification_sent(f"preworkout:{plan['id']}")
     ]
 
 
 def _elapsed_minutes(plan: dict, now: datetime) -> float:
+    planned_at = _planned_datetime(plan, now)
+    return (now - planned_at).total_seconds() / 60
+
+
+def _planned_datetime(plan: dict, now: datetime) -> datetime:
     hours, minutes = map(int, plan["planned_time"].split(":"))
-    planned_at = datetime.combine(
+    return datetime.combine(
         get_plan_date(plan["week_start"], plan["planned_day"]),
         datetime.min.time().replace(hour=hours, minute=minutes),
         tzinfo=now.tzinfo,
     )
-    return (now - planned_at).total_seconds() / 60
+
+
+def _is_due_today(now: datetime, hour: int, minute: int) -> bool:
+    due_at = datetime.combine(
+        now.date(),
+        datetime.min.time().replace(hour=hour, minute=minute),
+        tzinfo=now.tzinfo,
+    )
+    return now >= due_at
 
 
 def _post_workout_facts(plan: dict) -> str:

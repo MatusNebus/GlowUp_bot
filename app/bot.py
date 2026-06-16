@@ -98,7 +98,7 @@ client = discord.Client(intents=intents)
 logger = logging.getLogger(__name__)
 
 
-async def send_and_remember(channel, content: str):
+async def send_and_remember(channel, content: str, allow_mentions: bool = False):
     """Send a Jonáš response and persist it in channel memory."""
     content = str(content)
     internal_markers = (
@@ -112,7 +112,8 @@ async def send_and_remember(channel, content: str):
     if any(marker in content.casefold() for marker in internal_markers):
         logger.warning("Outgoing internal detail suppressed")
         content = "Prepáč, toto som nezachytil správne. Skús mi to napísať ešte raz jednoduchšie."
-    sent = await channel.send(content)
+    allowed_mentions = None if allow_mentions else discord.AllowedMentions.none()
+    sent = await channel.send(content, allowed_mentions=allowed_mentions)
     bot_user_id = str(client.user.id) if client.user else "jonas"
     bot_name = getattr(client.user, "display_name", "Jonáš") if client.user else "Jonáš"
     save_channel_message(bot_user_id, bot_name, str(channel.id), content, is_bot=True)
@@ -568,6 +569,10 @@ async def on_message(message: discord.Message) -> None:
 
     if normalized_command == "ping":
         await send_and_remember(message.channel, "Som online. Žiadne výhovorky.")
+        return
+
+    if normalized_command == "channel id":
+        await send_and_remember(message.channel, f"ID tohto kanála je: {message.channel.id}")
         return
 
     if normalized_command.startswith("dev reset"):
